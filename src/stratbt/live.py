@@ -139,6 +139,7 @@ class SessionSummary:
     halted: bool
     killed: bool
     audit: AuditLog = field(repr=False, default_factory=AuditLog)
+    open_positions: int = 0          # non-zero means the session ended with positions still held
 
 
 class LiveRunner:
@@ -197,10 +198,22 @@ class LiveRunner:
     def run(self) -> SessionSummary:
         self.audit.write("start", strategy=type(self.strategy).__name__, underlier=self.feed.underlier,
                          delay_s=self.delay_s)
+        self.broker.sync()               # live brokers load the venue's true positions here
         self.reconcile()
         pending: list[tuple[pd.Timestamp, Order]] = []
         killed = False
         equity = 0.0
+        try:
+            self._loop(pending, killed, equity)
+        except BaseException as e:
+            held = _encode(self.broker.holdings)
+            self.audit.write("aborted", error=f"{type(e).__name__}: {e}", open_positions=held)
+            if held:
+                logger.error("ABORTED WITH %d OPEN POSITION(S): %s", len(held), held)
+            raise
+        return self._summary
+
+    def _loop(self, pending, killed, equity) -> None:
         for snap in self.feed.snapshots():
             ts = snap.ts
             # 1. send orders whose delay has elapsed (all of them on the last tick)
@@ -242,9 +255,13 @@ class LiveRunner:
                 break
 
         rejections = len(getattr(self.broker, "rejections", []))
+        held = len(self.broker.holdings)
+        if held:
+            self.audit.write("ended_with_open_positions", positions=_encode(self.broker.holdings))
         self.audit.write("end", equity=equity, fills=self.n_fills, rejections=rejections, killed=killed)
-        return SessionSummary(net_pnl=equity, n_orders=self.n_orders, n_fills=self.n_fills, n_rejections=rejections,
-                              halted=self.broker.halted, killed=killed, audit=self.audit)
+        self._summary = SessionSummary(net_pnl=equity, n_orders=self.n_orders, n_fills=self.n_fills,
+                                       n_rejections=rejections, halted=self.broker.halted, killed=killed,
+                                       audit=self.audit, open_positions=held)
 
     def _submit(self, order: Order, ts: pd.Timestamp, snap: Snapshot) -> None:
         fill = self.broker.submit(order, ts, snap.option_price(order.instrument))

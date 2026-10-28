@@ -10,7 +10,7 @@ Public entry point: `build_pdf_report(result, strategy_name, period_label)`.
 """
 from io import BytesIO
 
-import matplotlib.pyplot as plt
+import matplotlib as mpl
 from matplotlib.backends.backend_pdf import PdfPages
 
 from stratbt.engine import BacktestResult
@@ -30,12 +30,11 @@ def build_pdf_report(result: BacktestResult, strategy_name: str = "", period_lab
     data = build_report_data(result, strategy_name, period_label)
     pages = build_all_pages(data)
     buffer = BytesIO()
-    with plt.rc_context(theme.RC), PdfPages(buffer, metadata={
+    with mpl.rc_context(theme.RC), PdfPages(buffer, metadata={
         "Title": f"{data.strategy_name} — backtest report", "Creator": f"stratbt {data.version}",
     }) as pdf:
         for fig, _section in pages:
             pdf.savefig(fig)
-            plt.close(fig)
     return buffer.getvalue()
 
 

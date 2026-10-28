@@ -189,3 +189,26 @@ class TestFormatters:
         assert T.series_color("SPY") != T.series_color("QQQ")
         assert T.series_color("Combined") == T.COMBINED
         assert T.series_color("NEW1") != T.series_color("NEW2")
+
+
+def test_pdf_can_be_built_from_a_worker_thread_without_a_gui_backend():
+    """Regression: pyplot's default (Tk) backend aborts the process when a figure is created off the main thread."""
+    import os
+    import subprocess
+    import sys
+    code = (
+        "import threading, matplotlib; matplotlib.use('TkAgg') if False else None\n"
+        "from stratbt import run_backtest, SyntheticProvider\n"
+        "from stratbt.report import build_pdf_report\n"
+        "r = run_backtest('fixed_window', SyntheticProvider(n_days=3), underliers=['SPY'])\n"
+        "out = []\n"
+        "t = threading.Thread(target=lambda: out.append(build_pdf_report(r)))\n"
+        "t.start(); t.join()\n"
+        "assert out and out[0][:5] == b'%PDF-'\n"
+        "import matplotlib.pyplot as plt\n"
+        "assert plt.get_fignums() == [], 'report must not leave pyplot figures behind'\n"
+        "print('ok')\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "MPLBACKEND"}      # the default backend, as a server would see it
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
+    assert proc.returncode == 0 and proc.stdout.strip() == "ok", proc.stderr[-600:]

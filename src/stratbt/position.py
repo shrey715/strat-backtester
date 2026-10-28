@@ -213,6 +213,10 @@ class Position:
         """Cumulative realized PnL from closed trades so far."""
         return self._realized
 
+    def load_holdings(self, holdings: dict[Instrument, tuple[float, int]]) -> None:
+        """Replace open positions (e.g. with what a broker reports at start-up). PnL history is untouched."""
+        self._holdings = dict(holdings)
+
     @property
     def fees(self) -> float:
         """Cumulative fees paid so far."""

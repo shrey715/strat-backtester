@@ -163,6 +163,77 @@ def _add_exec_args(r) -> None:
     r.add_argument("--max-contracts", type=int, help="cap on total contracts held")
 
 
+def cmd_live(args) -> int:
+    """Run a strategy against a real quote feed and broker. Defaults to dry-run: nothing is ever sent."""
+    import os
+    import signal
+    from datetime import datetime
+    from types import SimpleNamespace
+
+    from stratbt.adapters import BROKERS, REAL_MONEY_ENV, REAL_MONEY_TOKEN, build
+    from stratbt.execution import ExecutionModel
+    from stratbt.live import AuditLog, KillSwitch, LiveRunner
+    from stratbt.strategy import registry
+
+    mode = args.mode
+    if mode != "dry-run" and args.max_daily_loss is None:
+        raise SystemExit(f"--max-daily-loss is required in {mode} mode (the hard stop for the day, in account currency).")
+    confirm = None
+    if mode == "live":
+        confirm = os.environ.get(REAL_MONEY_ENV)
+        if confirm != REAL_MONEY_TOKEN:
+            if not sys.stdin.isatty():
+                raise SystemExit(f"Real-money trading needs confirmation: set {REAL_MONEY_ENV}={REAL_MONEY_TOKEN}")
+            print(f"\n  !! REAL MONEY: orders will be sent to your live {args.broker} account.\n"
+                  f"  Max {args.max_order_qty} contract(s) per order, {args.max_open_contracts} open, daily loss limit {args.max_daily_loss}.")
+            confirm = input(f"  Type {REAL_MONEY_TOKEN} to continue: ").strip()
+
+    venue = {}
+    if args.broker == "ibkr":
+        venue = {k: v for k, v in dict(host=args.ib_host, port=args.ib_port, exchange=args.ib_exchange,
+                                       currency=args.ib_currency, multiplier=args.ib_multiplier,
+                                       underlying_kind=args.ib_underlying, delayed=args.ib_delayed).items() if v not in (None, False)}
+    spec = registry.get(args.strategy)
+    feed, broker = build(args.broker, args.ticker, mode=mode, max_daily_loss=args.max_daily_loss,
+                         max_open_contracts=args.max_open_contracts, max_order_qty=args.max_order_qty,
+                         confirm_real_money=confirm, **venue)
+    session = SimpleNamespace(session_open=feed.session_open, session_close=feed.session_close)
+    strategy = spec.factory(session, **_parse_params(args.param))(feed.underlier, feed.expiry, feed.strikes)
+    broker.position.allow_short = strategy.allow_short
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    base = Path(args.log_dir or Path.home() / ".stratbt" / "live") / f"{stamp}_{args.broker}_{feed.underlier}_{mode}"
+    kill = KillSwitch(args.kill_file or f"{base}.STOP")
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: kill.kill())          # Ctrl-C flattens positions and stops cleanly
+
+    banner = {"dry-run": "DRY RUN — real quotes and decisions, NO ORDERS ARE SENT",
+              "paper": f"PAPER — orders go to the {args.broker} paper account",
+              "live": "LIVE — REAL MONEY"}[mode]
+    print(f"{spec.label} · {feed.underlier} · expiry {feed.expiry} · {args.broker} · {banner}")
+    print(f"  limits: {broker.risk.max_order_qty}/order, {broker.risk.max_open_contracts} open, daily loss {broker.risk.max_daily_loss}")
+    print(f"  stop it:  touch {kill.path}   (or Ctrl-C)      audit: {base}.jsonl")
+    runner = LiveRunner(strategy, feed, broker, ExecutionModel.instant(), audit=AuditLog(f"{base}.jsonl"), kill=kill,
+                        state_path=f"{base}.state.json", adopt_existing=args.adopt)
+    s = runner.run()
+    print(f"  done: net PnL {s.net_pnl:,.2f} · {s.n_fills} fills · {s.n_rejections} rejections"
+          f"{' · HALTED by loss limit' if s.halted else ''}{' · KILLED' if s.killed else ''}")
+    if s.open_positions:
+        print(f"  !! {s.open_positions} POSITION(S) STILL OPEN — check your broker account now.")
+        return 2
+    return 0
+
+
+def cmd_mcp(args) -> int:
+    try:
+        from stratbt.mcp_server import main as serve
+    except ImportError as e:
+        print(f"{e}")
+        return 1
+    serve(transport=args.transport, host=args.host, port=args.port, output_dir=args.output_dir)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="stratbt", description="Options strategy backtesting engine.")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -190,6 +261,33 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--kill-file", help="create this file to flatten everything and stop")
     pp.add_argument("--adopt", action="store_true", help="start even if the broker holds unknown positions")
     pp.set_defaults(func=cmd_paper)
+
+    lv = sub.add_parser("live", help="trade a strategy on a real feed/broker (default: dry-run, sends nothing)")
+    lv.add_argument("strategy")
+    lv.add_argument("--broker", choices=["alpaca", "public", "ibkr"], required=True)
+    lv.add_argument("--ticker", required=True, help="underlying, e.g. SPY")
+    lv.add_argument("--mode", choices=["dry-run", "paper", "live"], default="dry-run",
+                    help="dry-run: decide on real quotes, send nothing (default) · paper: venue's paper account · live: REAL MONEY")
+    lv.add_argument("--param", action="append", default=[], metavar="KEY=VALUE", help="strategy parameter")
+    lv.add_argument("--max-daily-loss", type=float, help="hard stop for the day (required for paper and live)")
+    lv.add_argument("--max-order-qty", type=int, default=1, help="contracts per order (default 1)")
+    lv.add_argument("--max-open-contracts", type=int, default=4, help="total contracts held at once (default 4)")
+    lv.add_argument("--kill-file", help="create this file to flatten everything and stop")
+    lv.add_argument("--log-dir", help="where the audit log and state file go (default ~/.stratbt/live)")
+    lv.add_argument("--adopt", action="store_true", help="start even if the account holds positions the saved state doesn't know")
+    lv.add_argument("--ib-host", default=None); lv.add_argument("--ib-port", type=int, default=None)
+    lv.add_argument("--ib-exchange", default=None); lv.add_argument("--ib-currency", default=None)
+    lv.add_argument("--ib-multiplier", default=None); lv.add_argument("--ib-underlying", choices=["Stock", "Index"], default=None)
+    lv.add_argument("--ib-delayed", action="store_true", help="use delayed market data")
+    lv.set_defaults(func=cmd_live)
+
+    m = sub.add_parser("mcp", help="serve the backtester to AI agents over the Model Context Protocol")
+    m.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio",
+                   help="stdio for desktop agents and IDEs (default); streamable-http for remote clients")
+    m.add_argument("--host", default="127.0.0.1", help="bind address for streamable-http")
+    m.add_argument("--port", type=int, default=8765, help="port for streamable-http")
+    m.add_argument("--output-dir", help="where export_report writes PDFs (default ~/stratbt-reports)")
+    m.set_defaults(func=cmd_mcp)
 
     a = sub.add_parser("app", help="launch the Streamlit dashboard")
     a.add_argument("--port", type=int, default=8501)

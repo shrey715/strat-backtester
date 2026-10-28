@@ -5,7 +5,8 @@ numbers and sentences come from data.py, drawing from charts.py/layout.py.
 """
 from __future__ import annotations
 
-import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.figure import Figure
 
 from stratbt.report import charts, theme as T
 from stratbt.report.data import ReportData
@@ -208,14 +209,14 @@ def appendix_page(data: ReportData) -> Page:
     return p
 
 
-def build_all_pages(data: ReportData) -> list[tuple[plt.Figure, str]]:
-    with plt.rc_context(T.RC):
+def build_all_pages(data: ReportData) -> list[tuple[Figure, str]]:
+    with mpl.rc_context(T.RC):
         pages = [summary_page(data), performance_page(data), risk_page(data), behaviour_page(data),
                  costs_page(data), *statistics_pages(data), appendix_page(data)]
     total = len(pages)
     out = []
     for i, p in enumerate(pages, 1):
-        with plt.rc_context(T.RC):
+        with mpl.rc_context(T.RC):
             p.chrome(data.strategy_name, i, total, data.generated_at, data.version)
         out.append((p.fig, p.section))
     return out

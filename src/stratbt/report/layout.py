@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import textwrap
 
-import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch
 
@@ -17,7 +18,9 @@ from stratbt.report import theme as T
 class Page:
     def __init__(self, section: str):
         self.section = section
-        self.fig = plt.figure(figsize=(T.PAGE_W, T.PAGE_H), facecolor=T.SURFACE)
+        # Object API, not pyplot: no GUI backend is ever touched, so building a report is safe from any thread
+        # (pyplot would try to open a Tk window and abort the whole process in a server worker).
+        self.fig = Figure(figsize=(T.PAGE_W, T.PAGE_H), facecolor=T.SURFACE)
 
     # ---- coordinates ---------------------------------------------------
     def _fx(self, x: float) -> float:
@@ -26,7 +29,7 @@ class Page:
     def _fy(self, y: float) -> float:
         return 1.0 - y / T.PAGE_H
 
-    def ax(self, x: float, y: float, w: float, h: float) -> plt.Axes:
+    def ax(self, x: float, y: float, w: float, h: float) -> Axes:
         """Axes whose top-left is (x, y) inches and size is w x h inches."""
         return self.fig.add_axes([self._fx(x), self._fy(y + h), w / T.PAGE_W, h / T.PAGE_H])
 

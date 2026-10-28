@@ -75,6 +75,9 @@ class Broker(ABC):
     def equity(self, prices: dict[Instrument, float]) -> float:
         """Net PnL (after fees) marked at `prices`."""
 
+    def sync(self) -> None:
+        """Load the true positions from the venue before trading starts. Simulated brokers have nothing to load."""
+
 
 class PaperBroker(Broker):
     """
@@ -140,7 +143,10 @@ class PaperBroker(Broker):
         reason = self._risk_reason(order, closing)
         if reason:
             return self._reject(ts, order, reason)
+        return self._execute(order, ts, ref_price)
 
+    def _execute(self, order: Order, ts: pd.Timestamp, ref_price: float) -> Fill | None:
+        """Turn an accepted order into a fill. Simulated here; live brokers override this to talk to a venue."""
         price = self.execution.fill_price(order.side, ref_price)
         fee = self.execution.fee(price, order.qty, self.position.multiplier)
         slip = abs(price - ref_price) * order.qty * self.position.multiplier

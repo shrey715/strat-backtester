@@ -24,6 +24,14 @@ app = [
 data = [
     "yfinance",      # real market data from Yahoo Finance (NSE, NASDAQ, NYSE, ...)
 ]
+agent = [
+    "mcp>=2",        # Model Context Protocol server: `stratbt mcp`
+    "yfinance",
+]
+alpaca = ["alpaca-py"]         # live/paper trading on Alpaca (US equities and options)
+ibkr = ["ib_async"]            # Interactive Brokers via TWS / IB Gateway (global markets, incl. NSE)
+public = ["publicdotcom-py"]   # Public.com
+brokers = ["alpaca-py", "ib_async", "publicdotcom-py"]
 notebooks = [
     "jupyterlab",
     "ipykernel",
@@ -47,6 +55,10 @@ dev = [
     "plotly",
     "statsmodels",
     "yfinance",
+    "mcp>=2",
+    "alpaca-py",
+    "ib_async",
+    "publicdotcom-py",
 ]
 
 [tool.pytest.ini_options]

@@ -84,6 +84,8 @@ class ReportData:
     observations: list[str]
     captions: dict[str, str] = field(default_factory=dict)
     risk_note: str = ""
+    stats: pd.DataFrame = field(default_factory=pd.DataFrame)     # numeric metrics (rows) x series (columns)
+    n_rejections: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -388,4 +390,5 @@ def build_report_data(result: BacktestResult, strategy_name: str = "", period_la
         intraday=intraday, am_pm=am_pm, weekday=wk, expiry=ex,
         total_rolls=total_rolls, avg_rolls_per_day=float(rpd["rolls"].mean()),
         observations=observations, captions=captions, risk_note=risk_note,
+        stats=stats, n_rejections=rejections,
     )
