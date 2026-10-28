@@ -1,0 +1,51 @@
+[project]
+name = "strat-backtester"
+version = "0.2.0"
+description = "Pluggable options-strategy backtesting engine with risk metrics, a Streamlit dashboard and PDF tearsheets"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Shreyas Deb" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+app = [
+    "streamlit",
+    "plotly",
+    "statsmodels",   # plotly's OLS trendline
+]
+notebooks = [
+    "jupyterlab",
+    "ipykernel",
+]
+
+[project.scripts]
+stratbt = "stratbt.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stratbt"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "streamlit",
+    "plotly",
+    "statsmodels",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "nse_data: needs the NSE tick dataset in data/allData (skipped when absent)",
+]

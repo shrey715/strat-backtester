@@ -1,0 +1,23 @@
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# jupyter
+.ipynb_checkpoints/
+
+# local market data (large, and usually licensed) — never commit
+/data/
+
+# misc
+.DS_Store
+.env
+.claude
+/results/

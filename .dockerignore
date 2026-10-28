@@ -1,0 +1,9 @@
+.git
+.venv
+data
+results
+notebooks
+tests
+__pycache__
+*.pyc
+.coverage
