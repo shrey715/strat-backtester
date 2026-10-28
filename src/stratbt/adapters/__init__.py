@@ -11,7 +11,7 @@ behind an explicit confirmation). See `stratbt.adapters.base` for the safety mod
 from stratbt.adapters.base import (REAL_MONEY_ENV, REAL_MONEY_TOKEN, FeedError, FillReport, LiveBroker, LiveSafety,
                                    LiveTradingNotConfirmed, PollingFeed, Quote, osi_symbol, parse_osi)
 
-BROKERS = ("alpaca", "public", "ibkr")
+BROKERS = ("alpaca", "public", "ibkr", "kite")
 
 
 def build(broker: str, ticker: str, mode: str = "dry-run", max_daily_loss: float | None = None,
@@ -23,9 +23,11 @@ def build(broker: str, ticker: str, mode: str = "dry-run", max_daily_loss: float
     """
     from stratbt.risk import RiskLimits
     kw = {k: v for k, v in dict(max_order_qty=max_order_qty, max_open_contracts=max_open_contracts).items() if v}
+    broker = broker.lower()
+    if broker == "kite":
+        kw.setdefault("tick", 0.05)                      # NSE options trade in 5-paise ticks
     safety = LiveSafety(mode=mode, confirm_real_money=confirm_real_money, **kw)
     risk = RiskLimits(max_daily_loss=max_daily_loss)
-    broker = broker.lower()
     if broker == "alpaca":
         from stratbt.adapters.alpaca import AlpacaBroker, AlpacaFeed
         b = AlpacaBroker(risk=risk, safety=safety, allow_short=allow_short, **venue_kwargs.get("broker", {}))
@@ -42,6 +44,13 @@ def build(broker: str, ticker: str, mode: str = "dry-run", max_daily_loss: float
         b = IBKRBroker(ib, risk=risk, safety=safety, allow_short=allow_short,
                        **{k: opts[k] for k in ("exchange", "currency", "multiplier") if k in opts})
         feed = IBKRFeed.create(ticker, ib, mode=mode, **{k: opts[k] for k in ("exchange", "currency", "multiplier", "underlying_kind", "delayed") if k in opts})
+    elif broker == "kite":
+        from stratbt.adapters.kite import KiteBroker, KiteFeed, make_client
+        kite = venue_kwargs.get("kite") or make_client()
+        exchange = venue_kwargs.get("exchange", "NFO")
+        feed = KiteFeed.create(ticker, kite, exchange=exchange, index_key=venue_kwargs.get("index_key"))
+        b = KiteBroker(kite, feed.table, lot_size=feed.lot_size, product=venue_kwargs.get("product", "NRML"),
+                       risk=risk, safety=safety, allow_short=allow_short)
     else:
         raise ValueError(f"Unknown broker '{broker}'. Available: {', '.join(BROKERS)}")
     return feed, b.attach(feed)

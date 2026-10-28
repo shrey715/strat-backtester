@@ -189,6 +189,8 @@ def cmd_live(args) -> int:
             confirm = input(f"  Type {REAL_MONEY_TOKEN} to continue: ").strip()
 
     venue = {}
+    if args.broker == "kite":
+        venue = {k: v for k, v in dict(exchange=args.kite_exchange, product=args.kite_product, index_key=args.kite_index_key).items() if v}
     if args.broker == "ibkr":
         venue = {k: v for k, v in dict(host=args.ib_host, port=args.ib_port, exchange=args.ib_exchange,
                                        currency=args.ib_currency, multiplier=args.ib_multiplier,
@@ -221,6 +223,21 @@ def cmd_live(args) -> int:
     if s.open_positions:
         print(f"  !! {s.open_positions} POSITION(S) STILL OPEN — check your broker account now.")
         return 2
+    return 0
+
+
+def cmd_kite_login(args) -> int:
+    """Get today's Zerodha access token (it expires daily)."""
+    import os
+    from stratbt.adapters.kite import exchange_request_token, login_url
+    if not os.environ.get("KITE_API_KEY"):
+        raise SystemExit("Set KITE_API_KEY (and KITE_API_SECRET) from your Kite Connect app first.")
+    print("1. Open this URL, log in to Zerodha, and approve the app:\n\n   " + login_url() + "\n")
+    print("2. You are redirected to your app's redirect URL. Paste that whole URL (or just the request_token value) here.")
+    raw = input("   > ").strip()
+    token = exchange_request_token(raw)
+    print("\nToday's access token (valid until the morning; treat it like a password):\n")
+    print(f"   export KITE_ACCESS_TOKEN={token}\n")
     return 0
 
 
@@ -264,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
 
     lv = sub.add_parser("live", help="trade a strategy on a real feed/broker (default: dry-run, sends nothing)")
     lv.add_argument("strategy")
-    lv.add_argument("--broker", choices=["alpaca", "public", "ibkr"], required=True)
+    lv.add_argument("--broker", choices=["alpaca", "public", "ibkr", "kite"], required=True)
     lv.add_argument("--ticker", required=True, help="underlying, e.g. SPY")
     lv.add_argument("--mode", choices=["dry-run", "paper", "live"], default="dry-run",
                     help="dry-run: decide on real quotes, send nothing (default) · paper: venue's paper account · live: REAL MONEY")
@@ -275,11 +292,17 @@ def main(argv: list[str] | None = None) -> int:
     lv.add_argument("--kill-file", help="create this file to flatten everything and stop")
     lv.add_argument("--log-dir", help="where the audit log and state file go (default ~/.stratbt/live)")
     lv.add_argument("--adopt", action="store_true", help="start even if the account holds positions the saved state doesn't know")
+    lv.add_argument("--kite-exchange", choices=["NFO", "BFO"], default=None, help="Kite: NFO (NSE, default) or BFO (BSE)")
+    lv.add_argument("--kite-product", choices=["NRML", "MIS"], default=None,
+                    help="Kite: NRML (default) or MIS (Zerodha auto-squares MIS around 15:20)")
+    lv.add_argument("--kite-index-key", default=None, help="Kite: override the underlying quote key, e.g. 'NSE:NIFTY BANK'")
     lv.add_argument("--ib-host", default=None); lv.add_argument("--ib-port", type=int, default=None)
     lv.add_argument("--ib-exchange", default=None); lv.add_argument("--ib-currency", default=None)
     lv.add_argument("--ib-multiplier", default=None); lv.add_argument("--ib-underlying", choices=["Stock", "Index"], default=None)
     lv.add_argument("--ib-delayed", action="store_true", help="use delayed market data")
     lv.set_defaults(func=cmd_live)
+
+    sub.add_parser("kite-login", help="get today's Zerodha Kite access token").set_defaults(func=cmd_kite_login)
 
     m = sub.add_parser("mcp", help="serve the backtester to AI agents over the Model Context Protocol")
     m.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio",

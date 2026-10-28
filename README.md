@@ -174,15 +174,16 @@ What it adds on top of the backtest loop:
 
 `stratbt paper` runs the latest (or a chosen) session this way from the command line, with no venue involved.
 
-### Real venues (Alpaca · Interactive Brokers · Public)
+### Real venues (Alpaca · Interactive Brokers · Public · Zerodha Kite)
 
-The same runner can trade against a real quote feed and broker. Three adapters ship, each a *feed* (quotes → per-second snapshots) plus a *broker* (orders → venue):
+The same runner can trade against a real quote feed and broker. Four adapters ship, each a *feed* (quotes → per-second snapshots) plus a *broker* (orders → venue):
 
 | Venue | SDK | Markets | Paper account? | Install |
 |---|---|---|---|---|
 | **Alpaca** | `alpaca-py` | US equities and options | Yes (separate keys) | `pip install 'strat-backtester[alpaca]'` |
 | **Interactive Brokers** | `ib_async` | Almost everywhere, including NSE | Yes (`DU…` accounts) | `pip install 'strat-backtester[ibkr]'` |
 | **Public.com** | `publicdotcom-py` | US equities and options | **No** — dry-run uses Public's pre-flight check | `pip install 'strat-backtester[public]'` |
+| **Zerodha Kite** | `kiteconnect` | **NSE** (and BSE) index and stock options | **No** — dry-run uses Kite's order-margins check | `pip install 'strat-backtester[kite]'` |
 
 ```bash
 export ALPACA_API_KEY=… ALPACA_SECRET_KEY=…           # credentials live in the environment, never on the command line
@@ -191,6 +192,16 @@ stratbt live iron_condor --broker alpaca --ticker SPY --mode paper --max-daily-l
 STRATBT_CONFIRM_REAL_MONEY=I_ACCEPT_REAL_MONEY_TRADING_RISK \
   stratbt live iron_condor --broker alpaca --ticker SPY --mode live --max-daily-loss 100    # 3. real money
 ```
+
+**NSE with Zerodha Kite** (`pip install 'strat-backtester[kite]'`): the access token expires daily, so each morning run `stratbt kite-login` (it prints the login URL, takes the redirect URL back, and prints the `export KITE_ACCESS_TOKEN=…` line). Then:
+
+```bash
+export KITE_API_KEY=… KITE_ACCESS_TOKEN=…
+stratbt live short_strangle --broker kite --ticker NIFTY                      # dry-run: real quotes, margin-checked with Kite, nothing sent
+stratbt live iron_condor --broker kite --ticker BANKNIFTY --kite-product NRML --mode live --max-daily-loss 5000
+```
+
+Kite specifics the adapter handles: quantity is in **units** (1 contract = one lot of `lot_size` units, read from the instruments master, which is also the P&L multiplier, so PnL is in rupees); symbols are looked up in the `NFO`/`BFO` instruments dump, never constructed; prices snap to the 5-paise tick; one quote call per second carries the underlying and every watched option; a flat ₹20 brokerage per executed order is charged (statutory STT/exchange/GST charges are **not** modelled, so reported PnL is slightly flattering); partial fills are booked in whole lots, rounding down. The default session ends at 15:25 to leave time to flatten before the 15:30 close; Zerodha auto-squares **MIS** positions around 15:20, so use NRML (the default) or an earlier close.
 
 **Safety model** — it is deliberately hard to lose money by accident:
 
@@ -202,9 +213,9 @@ STRATBT_CONFIRM_REAL_MONEY=I_ACCEPT_REAL_MONEY_TRADING_RISK \
 - **Mode must match the account.** Interactive Brokers: rehearsal modes refuse a non-`DU` account and `live` refuses a paper one, so a wrong port can't turn a test into real trading or the reverse.
 - **Reconciliation on start** against the venue's true positions; **kill switch** (create the `…STOP` file or press Ctrl-C: flatten and stop); **audit log** of every decision and fill in `~/.stratbt/live/`; and if the feed dies with positions open the run says so loudly instead of exiting quietly.
 
-**What is and isn't verified.** The runner is proven identical to the backtester (parity tests). Each adapter is tested end to end against fakes that mimic its SDK and record exactly what would be sent — correct option symbols, open/close intent, limit prices, timeout cancels, partial fills, mode gates — and the safety rules were mutation-tested (breaking each one makes the suite fail). **No adapter has been run against a real brokerage**, so before trusting one: run `dry-run` for a full session, then `paper` (where it exists), then the smallest possible live order. Public's adapter in particular is written against the SDK's documented models and its position-sign and cost-basis conventions for short options should be confirmed with a one-contract test.
+**What is and isn't verified.** The runner is proven identical to the backtester (parity tests). Each adapter is tested end to end against fakes that mimic its SDK and record exactly what would be sent — correct option symbols, open/close intent, limit prices, timeout cancels, partial fills, mode gates — and the safety rules were mutation-tested (breaking each one makes the suite fail). **No adapter has been run against a real brokerage**, so before trusting one: run `dry-run` for a full session, then `paper` (where it exists), then the smallest possible live order. Public's and Zerodha's adapters in particular are written against the vendors' documented models: confirm the position-sign convention for short options (and, for Kite, the `NIFTY BANK` index quote key) with a one-lot test.
 
-**Adding a venue** means implementing two small classes: a `PollingFeed` (`fetch_underlying`, `fetch_options`) and a `LiveBroker` (`_place`, `positions`, optionally `_preflight`). Everything above — modes, caps, quote checks, order tracking, ledger — is inherited. Zerodha Kite (NSE), Tradier, tastytrade and Schwab all have Python SDKs and would follow the same shape.
+**Adding a venue** means implementing two small classes: a `PollingFeed` (`fetch_underlying`, `fetch_options`) and a `LiveBroker` (`_place`, `positions`, optionally `_preflight`). Everything above — modes, caps, quote checks, order tracking, ledger — is inherited. Tradier, tastytrade and Schwab all have Python SDKs and would follow the same shape.
 
 The MCP server (below) intentionally exposes **no** live-trading tool: an agent can research and rehearse, never trade.
 
@@ -269,7 +280,7 @@ src/stratbt/
 ├── engine.py        Backtest loop, DayResult / BacktestResult
 ├── broker.py        Broker interface · PaperBroker (fills, fees, risk)
 ├── live.py          LiveRunner · QuoteFeed · ReplayFeed · AuditLog · KillSwitch · reconciliation
-├── adapters/        Alpaca · Interactive Brokers · Public: feeds + brokers, safety model, OSI symbols
+├── adapters/        Alpaca · Interactive Brokers · Public · Zerodha Kite: feeds + brokers, safety model
 ├── execution.py     ExecutionModel (delay, spread, commissions)
 ├── risk.py          RiskLimits
 ├── position.py      Ledger: long/short, average cost, multiplier, fees, slippage
@@ -278,7 +289,7 @@ src/stratbt/
 ├── dashboard/       Streamlit app + Plotly charts (interactive)
 ├── mcp_server.py    Model Context Protocol server for AI agents
 ├── palette.py       One colour palette for the dashboard and the PDF
-└── cli.py           `stratbt` command (strategies · run · paper · live · app · mcp)
+└── cli.py           `stratbt` command (strategies · run · paper · live · kite-login · app · mcp)
 notebooks/           quickstart (offline) · positions & metrics walkthrough
 tests/               pytest suite — runs offline
 ```

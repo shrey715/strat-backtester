@@ -313,12 +313,16 @@ class PollingFeed(QuoteFeed):
             return None
         return q.mid
 
+    def _fetch(self, wanted: list[Instrument]) -> None:
+        """One refresh. Override when a venue can return the underlying and options in a single call."""
+        self._under = self.fetch_underlying()
+        if wanted:
+            self._quotes.update(self.fetch_options(wanted))
+
     def _refresh(self) -> None:
         wanted = [i for i, t in self._watch.items() if self._tick - t < 120][-self.MAX_WATCHED:]
         try:
-            self._under = self.fetch_underlying()
-            if wanted:
-                self._quotes.update(self.fetch_options(wanted))
+            self._fetch(wanted)
             self._failures = 0
         except Exception as e:
             self._failures += 1

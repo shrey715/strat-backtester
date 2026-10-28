@@ -31,7 +31,8 @@ agent = [
 alpaca = ["alpaca-py"]         # live/paper trading on Alpaca (US equities and options)
 ibkr = ["ib_async"]            # Interactive Brokers via TWS / IB Gateway (global markets, incl. NSE)
 public = ["publicdotcom-py"]   # Public.com
-brokers = ["alpaca-py", "ib_async", "publicdotcom-py"]
+kite = ["kiteconnect"]         # Zerodha Kite Connect (NSE / BSE)
+brokers = ["alpaca-py", "ib_async", "publicdotcom-py", "kiteconnect"]
 notebooks = [
     "jupyterlab",
     "ipykernel",
@@ -59,6 +60,7 @@ dev = [
     "alpaca-py",
     "ib_async",
     "publicdotcom-py",
+    "kiteconnect",
 ]
 
 [tool.pytest.ini_options]

@@ -121,3 +121,16 @@ def test_strategy_parameters_reach_the_strategy(venue, tmp_path, capsys):
 def test_ibkr_options_are_forwarded(venue, tmp_path, capsys):
     live(["iron_condor", "--broker", "ibkr", "--ticker", "SPY", "--ib-port", "4002", "--ib-exchange", "SMART", "--ib-delayed"], tmp_path, capsys)
     assert venue.calls[0]["venue"] == {"port": 4002, "exchange": "SMART", "delayed": True}
+
+
+def test_kite_options_are_forwarded(venue, tmp_path, capsys):
+    live(["iron_condor", "--broker", "kite", "--ticker", "NIFTY", "--kite-product", "MIS", "--kite-exchange", "BFO",
+          "--kite-index-key", "NSE:NIFTY 50"], tmp_path, capsys)
+    assert venue.calls[0]["venue"] == {"exchange": "BFO", "product": "MIS", "index_key": "NSE:NIFTY 50"}
+
+
+def test_kite_login_command_is_registered(capsys):
+    with pytest.raises(SystemExit, match="KITE_API_KEY"):
+        import os
+        os.environ.pop("KITE_API_KEY", None)
+        cli.main(["kite-login"])

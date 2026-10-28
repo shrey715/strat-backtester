@@ -18,14 +18,14 @@ OPEN, CLOSE = time(9, 30), time(9, 49, 59)        # a 20-minute session keeps te
 class MarketSim:
     """Quotes for one synthetic day, advanced by a fake clock (sleep() moves time forward)."""
 
-    def __init__(self, seed: int = 3, half_spread: float = 0.02):
-        self.provider = SyntheticProvider(n_days=2, seed=seed)
+    def __init__(self, seed: int = 3, half_spread: float = 0.02, ticker: str = "SPY", tz: ZoneInfo = NY, underliers: dict | None = None):
+        self.provider = SyntheticProvider(n_days=2, seed=seed, underliers=underliers)
         self.day = self.provider.trading_days[0]
-        self.ticker = "SPY"
+        self.ticker, self.tz = ticker, tz
         self.half = half_spread
         self.expiry = self.provider.front_expiry(self.day, self.ticker)
         self.strikes = [int(k) for k in self.provider.strikes(self.day, self.ticker, self.expiry)]
-        self.now = datetime.combine(self.day, time(9, 29, 55), NY).timestamp()
+        self.now = datetime.combine(self.day, time(9, 29, 55), self.tz).timestamp()
         self._under = self.provider.underlying_prices(self.day, self.ticker).to_numpy()
         self._opt = {}
         self.wide_spread = False
@@ -39,8 +39,8 @@ class MarketSim:
         return True
 
     def _idx(self) -> int:
-        local = datetime.fromtimestamp(self.now, NY)
-        return max(0, min(int((local - datetime.combine(self.day, time(9, 30), NY)).total_seconds()), len(self._under) - 1))
+        local = datetime.fromtimestamp(self.now, self.tz)
+        return max(0, min(int((local - datetime.combine(self.day, time(9, 30), self.tz)).total_seconds()), len(self._under) - 1))
 
     def underlying(self) -> float:
         return float(self._under[self._idx()])
@@ -65,7 +65,15 @@ class MarketSim:
 
 
 def feed_kwargs(sim: MarketSim) -> dict:
-    return dict(session_open=OPEN, session_close=CLOSE, tz="America/New_York", poll_interval_s=1.0, clock=sim.clock, sleep=sim.sleep)
+    return dict(session_open=OPEN, session_close=CLOSE, tz=sim.tz.key, poll_interval_s=1.0, clock=sim.clock, sleep=sim.sleep)
+
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def nse_sim(**kw) -> MarketSim:
+    """A NIFTY-like market (strikes every 50) on India time."""
+    return MarketSim(ticker="NIFTY", tz=IST, underliers={"NIFTY": (24000.0, 50)}, half_spread=0.10, **kw)
 
 
 # ── Alpaca ───────────────────────────────────────────────────────────────
@@ -269,3 +277,97 @@ class FakeIB:
 
     def positions(self):
         return self._positions
+
+
+# ── Zerodha Kite ─────────────────────────────────────────────────────────
+
+def _tick(x: float, t: float = 0.05) -> float:
+    return round(round(x / t) * t, 2)
+
+
+class FakeKite:
+    """Mimics the parts of KiteConnect the adapter uses; records every call."""
+
+    def __init__(self, sim: MarketSim, lot_size: int = 75, fill: str = "full", positions=None, margin_error: Exception | None = None,
+                 fill_lots: int = 2, fill_units: int | None = None):
+        self.sim, self.lot, self.fill, self._positions, self.margin_error, self.fill_lots = sim, lot_size, fill, positions or [], margin_error, fill_lots
+        self.fill_units = fill_units
+        self.placed, self.cancelled, self.margin_checks, self.quote_calls, self._orders = [], [], [], [], {}
+        self._n = 0
+        self.symbols = {}
+
+    def profile(self):
+        return {"user_id": "AB1234"}
+
+    def instruments(self, exchange=None):
+        s = self.sim
+        rows = []
+        for k in s.strikes:
+            for t in ("CE", "PE"):
+                sym = f"{s.ticker}{s.expiry:%y%b}{k}{t}".upper()
+                self.symbols[sym] = (k, t)
+                rows.append(dict(instrument_token=len(rows) + 1, tradingsymbol=sym, name=s.ticker, expiry=s.expiry, strike=float(k),
+                                 tick_size=0.05, lot_size=self.lot, instrument_type=t, segment="NFO-OPT", exchange="NFO"))
+        rows.append(dict(instrument_token=999, tradingsymbol=f"{s.ticker}FUT", name=s.ticker, expiry=s.expiry, strike=0.0, tick_size=0.05,
+                         lot_size=self.lot, instrument_type="FUT", segment="NFO-FUT", exchange="NFO"))      # decoys the filter must ignore
+        rows.append(dict(instrument_token=998, tradingsymbol="BANKNIFTY99XXX1CE", name="BANKNIFTY", expiry=s.expiry, strike=1.0,
+                         tick_size=0.05, lot_size=15, instrument_type="CE", segment="NFO-OPT", exchange="NFO"))
+        return rows
+
+    def _inst(self, tradingsymbol):
+        k, t = self.symbols[tradingsymbol]
+        return Instrument(self.sim.ticker, self.sim.expiry, k, t)
+
+    def quote(self, *keys):
+        self.quote_calls.append(keys)
+        out = {}
+        for key in keys:
+            ex, _, sym = key.partition(":")
+            if sym == "NIFTY 50":
+                out[key] = {"last_price": self.sim.underlying(), "depth": {"buy": [{"price": 0, "quantity": 0, "orders": 0}], "sell": [{"price": 0}]}}
+            elif sym in self.symbols:
+                ba = self.sim.bid_ask(self._inst(sym))
+                if ba:
+                    out[key] = {"last_price": _tick(sum(ba) / 2), "depth": {"buy": [{"price": _tick(ba[0]), "quantity": 750, "orders": 4}],
+                                                                           "sell": [{"price": _tick(ba[1]), "quantity": 750, "orders": 4}]}}
+        return out
+
+    def order_margins(self, params):
+        self.margin_checks.append(params)
+        if self.margin_error:
+            raise self.margin_error
+        return [{"total": 1000.0}]
+
+    def place_order(self, **kw):
+        if self.fill == "error":
+            raise RuntimeError("503 gateway")
+        self._n += 1
+        oid = f"2610{self._n:08d}"
+        self.placed.append(kw)
+        self._orders[oid] = {"kw": kw, "cancelled": False}
+        return oid
+
+    def order_history(self, oid):
+        rec = self._orders[oid]
+        kw = rec["kw"]
+        qty = kw["quantity"]
+        if self.fill == "full":
+            return [{"status": "OPEN"}, {"status": "COMPLETE", "filled_quantity": qty, "pending_quantity": 0, "average_price": kw["price"]}]
+        if self.fill == "partial":
+            filled = self.fill_units if self.fill_units is not None else min(self.fill_lots * self.lot, qty)
+            return [{"status": "CANCELLED" if rec["cancelled"] else "OPEN", "filled_quantity": filled, "average_price": kw["price"]}]
+        return [{"status": "CANCELLED" if rec["cancelled"] else "OPEN", "filled_quantity": 0, "average_price": 0}]    # never fills
+
+    def cancel_order(self, variety, order_id, parent_order_id=None):
+        self.cancelled.append((variety, order_id))
+        self._orders[order_id]["cancelled"] = True
+
+    def positions(self):
+        return {"net": self._positions, "day": []}
+
+    def login_url(self):
+        return "https://kite.zerodha.com/connect/login?v=3&api_key=KEY"
+
+    def generate_session(self, request_token, api_secret):
+        self.session_args = (request_token, api_secret)
+        return {"access_token": "TOKEN_FOR_TODAY"}
