@@ -12,6 +12,7 @@ class Trade:
     price: float
     qty: int = 1
     fee: float = 0.0  # commission/fees charged on this fill, in currency
+    slippage: float = 0.0  # cost of crossing the spread vs the mid price, in currency
 
 class Position:
     """
@@ -41,6 +42,7 @@ class Position:
         self._holdings: dict[Instrument, tuple[float, int]] = {}
         self._realized: float = 0.0
         self._fees: float = 0.0
+        self._slippage: float = 0.0
         self._trades: list[Trade] = []
 
     def _apply(self, inst: Instrument, signed_qty: int, price: float) -> None:
@@ -67,7 +69,7 @@ class Position:
             self._holdings[inst] = (price, remaining)   # flipped through zero
 
     def buy(self, ts: pd.Timestamp, inst: Instrument, price: float, qty: int = 1,
-            fee: float = 0.0) -> Trade:
+            fee: float = 0.0, slippage: float = 0.0) -> Trade:
         """
         Open a new long position or scale into an existing one.
 
@@ -83,6 +85,9 @@ class Position:
             Lots to buy. Must be positive.
         fee : float, default 0.0
             Fees charged on this fill (tracked in `fees`, not in `realized`).
+        slippage : float, default 0.0
+            Currency cost of this fill versus the mid price. Informational:
+            it is already inside `price`, and only used for cost reporting.
 
         Returns
         -------
@@ -104,12 +109,13 @@ class Position:
             raise ValueError("Quantity must be positive")
         self._apply(inst, qty, price)
         self._fees += fee
-        trade = Trade(timestamp=ts, instrument=inst, side='BUY', price=price, qty=qty, fee=fee)
+        self._slippage += slippage
+        trade = Trade(timestamp=ts, instrument=inst, side='BUY', price=price, qty=qty, fee=fee, slippage=slippage)
         self._trades.append(trade)
         return trade
 
     def sell(self, ts: pd.Timestamp, inst: Instrument, price: float, qty: int = 1,
-             fee: float = 0.0) -> Trade:
+             fee: float = 0.0, slippage: float = 0.0) -> Trade:
         """
         Close all or part of an existing long position.
 
@@ -127,6 +133,9 @@ class Position:
             the held quantity.
         fee : float, default 0.0
             Fees charged on this fill (tracked in `fees`, not in `realized`).
+        slippage : float, default 0.0
+            Currency cost of this fill versus the mid price. Informational:
+            it is already inside `price`, and only used for cost reporting.
 
         Returns
         -------
@@ -156,7 +165,8 @@ class Position:
                 raise ValueError(f"Cannot sell {qty} of {inst} — only {held_qty} held")
         self._apply(inst, -qty, price)
         self._fees += fee
-        trade = Trade(timestamp=ts, instrument=inst, side='SELL', price=price, qty=qty, fee=fee)
+        self._slippage += slippage
+        trade = Trade(timestamp=ts, instrument=inst, side='SELL', price=price, qty=qty, fee=fee, slippage=slippage)
         self._trades.append(trade)
         return trade
 
@@ -207,6 +217,11 @@ class Position:
     def fees(self) -> float:
         """Cumulative fees paid so far."""
         return self._fees
+
+    @property
+    def slippage(self) -> float:
+        """Cumulative slippage cost (spread paid vs mid), already reflected in fill prices."""
+        return self._slippage
 
     @property
     def net_realized(self) -> float:

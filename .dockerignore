@@ -1,6 +1,5 @@
 .git
 .venv
-data
 results
 notebooks
 tests

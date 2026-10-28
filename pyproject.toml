@@ -16,9 +16,13 @@ dependencies = [
 
 [project.optional-dependencies]
 app = [
+    "yfinance",
     "streamlit",
     "plotly",
     "statsmodels",   # plotly's OLS trendline
+]
+data = [
+    "yfinance",      # real market data from Yahoo Finance (NSE, NASDAQ, NYSE, ...)
 ]
 notebooks = [
     "jupyterlab",
@@ -42,10 +46,8 @@ dev = [
     "streamlit",
     "plotly",
     "statsmodels",
+    "yfinance",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = [
-    "nse_data: needs the NSE tick dataset in data/allData (skipped when absent)",
-]

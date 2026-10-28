@@ -82,6 +82,10 @@ class OptionStructureStrategy(BaseStrategy):
         self.SESSION_CLOSE = session_close or type(self).SESSION_CLOSE
         self._done = False   # entered once (or tried and stopped out): never re-enter
         self._legs = self.build_legs()
+        # thresholds as seconds-of-day: comparing ints is ~10x cheaper than Timestamp arithmetic per tick
+        so, sc = self.SESSION_OPEN, self.SESSION_CLOSE
+        self._entry_s = so.hour * 3600 + so.minute * 60 + so.second + entry_delay_s
+        self._exit_s = sc.hour * 3600 + sc.minute * 60 + sc.second - exit_buffer_s
 
     def build_legs(self) -> tuple[Leg, ...]:
         """The legs of this structure. Override in subclasses."""
@@ -108,22 +112,20 @@ class OptionStructureStrategy(BaseStrategy):
         return total
 
     def on_second(self, ts: pd.Timestamp, futures_price: float, option_price, holdings) -> list[Order]:
-        so, sc = self.SESSION_OPEN, self.SESSION_CLOSE
-        open_ts = ts.replace(hour=so.hour, minute=so.minute, second=so.second, microsecond=0)
-        close_ts = ts.replace(hour=sc.hour, minute=sc.minute, second=sc.second, microsecond=0)
-        entry_ts = open_ts + pd.Timedelta(seconds=self.entry_delay_s)
-        exit_ts = close_ts - pd.Timedelta(seconds=self.exit_buffer_s)
+        sod = ts.hour * 3600 + ts.minute * 60 + ts.second
 
         if holdings:
-            if ts >= exit_ts:
+            if sod >= self._exit_s:
                 return flatten_orders(holdings)
+            if not (self.take_profit or self.stop_loss):
+                return []
             pnl = self._pnl(option_price, holdings)
             if (self.take_profit and pnl >= self.take_profit) or \
                (self.stop_loss and pnl <= -self.stop_loss):
                 return flatten_orders(holdings)
             return []
 
-        if self._done or not (entry_ts <= ts < exit_ts):
+        if self._done or not (self._entry_s <= sod < self._exit_s):
             return []
 
         legs = self._instruments(nearest_strike(self.strikes, futures_price))
@@ -143,6 +145,7 @@ class LongStrangle(OptionStructureStrategy):
 class ShortStraddle(OptionStructureStrategy):
     """Sell the ATM call and put: collect premium, lose on big moves (unlimited risk)."""
     allow_short = True
+    unlimited_risk = True
     def build_legs(self):
         return (Leg("CE", 0, "SELL"), Leg("PE", 0, "SELL"))
 
@@ -150,6 +153,7 @@ class ShortStraddle(OptionStructureStrategy):
 class ShortStrangle(OptionStructureStrategy):
     """Sell an OTM call and put `width` strikes away: wider profit zone than a short straddle (unlimited risk)."""
     allow_short = True
+    unlimited_risk = True
     def build_legs(self):
         return (Leg("CE", self.width, "SELL"), Leg("PE", -self.width, "SELL"))
 

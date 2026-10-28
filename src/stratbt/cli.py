@@ -7,15 +7,18 @@ import sys
 from datetime import date
 from pathlib import Path
 
-DEFAULT_DATA_ENV = "STRATBT_DATA_DIR"
 
 
-def build_provider(kind: str, data_dir: str | None, seed: int, days: int):
-    from stratbt.providers import NSETickProvider, SyntheticProvider
-    if kind == "synthetic":
-        return SyntheticProvider(n_days=days, seed=seed)
-    path = data_dir or os.environ.get(DEFAULT_DATA_ENV) or "data/allData"
-    return NSETickProvider(path)
+def build_provider(args):
+    from stratbt.providers import SyntheticProvider, YahooFinanceProvider
+    if args.provider == "synthetic":
+        return SyntheticProvider(n_days=args.days, seed=args.seed)
+    if not args.tickers:
+        raise SystemExit("--provider yahoo needs --tickers, e.g. --tickers SPY QQQ  or  --tickers ^NSEI")
+    return YahooFinanceProvider(
+        args.tickers, interval=args.interval, lookback_days=args.lookback, iv_premium=args.iv_premium,
+        vol=args.vol, expiry_weekday=args.expiry_weekday, multiplier=args.multiplier,
+    )
 
 
 def build_execution(name: str):
@@ -50,15 +53,12 @@ def cmd_run(args) -> int:
 
     from stratbt import metrics
     from stratbt.api import run_backtest
-    from stratbt.execution import ExecutionModel
     from stratbt.risk import RiskLimits
 
     logging.basicConfig(level=logging.WARNING)
-    provider = build_provider(args.provider, args.data_dir, args.seed, args.days)
+    provider = build_provider(args)
     risk = RiskLimits(max_daily_loss=args.max_daily_loss, max_open_contracts=args.max_contracts)
-    execution = build_execution(args.execution)
-    if args.commission is not None:
-        execution = ExecutionModel(**{**execution.__dict__, "commission_per_contract": args.commission})
+    execution = _execution_from(args)
 
     result = run_backtest(
         args.strategy, provider, _parse_params(args.param), execution, risk,
@@ -70,7 +70,8 @@ def cmd_run(args) -> int:
         print("No results produced.")
         return 1
     pd.set_option("display.width", 200, "display.max_columns", 30)
-    print(f"\n{args.strategy} on {provider.name} data — PnL in {result.unit}, execution={args.execution}\n")
+    note = "  (real underlying bars; options priced by Black-Scholes)" if provider.name == "yahoo" else ""
+    print(f"\n{args.strategy} on {provider.name} data — PnL in {result.unit}, execution={args.execution}{note}\n")
     print(metrics.summary_table(result).T.to_string())
     fees = sum(dr.fees for dr in result.day_results)
     rejected = sum(len(dr.rejections) for dr in result.day_results)
@@ -93,10 +94,73 @@ def cmd_app(args) -> int:
         return 1
     app = Path(__file__).parent / "dashboard" / "app.py"
     cmd = [sys.executable, "-m", "streamlit", "run", str(app), "--server.port", str(args.port),
-           "--browser.gatherUsageStats", "false"]
-    if args.data_dir:
-        os.environ[DEFAULT_DATA_ENV] = args.data_dir
+           "--browser.gatherUsageStats", "false",
+           "--theme.primaryColor", "#2a78d6"]
     return subprocess.call(cmd)
+
+
+def _execution_from(args):
+    from stratbt.execution import ExecutionModel
+    execution = build_execution(args.execution)
+    overrides = {"delay_s": args.delay_s, "half_spread_bps": args.half_spread_bps,
+                 "min_half_spread": args.min_half_spread, "commission_per_contract": args.commission}
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    return ExecutionModel(**{**execution.__dict__, **overrides}) if overrides else execution
+
+
+def cmd_paper(args) -> int:
+    """Replay one session through the live runner with a paper broker (rehearsal for a real feed)."""
+    from datetime import date as _date
+    from stratbt.broker import PaperBroker
+    from stratbt.live import AuditLog, KillSwitch, LiveRunner, ReplayFeed
+    from stratbt.risk import RiskLimits
+    from stratbt.strategy import registry
+
+    provider = build_provider(args)
+    day = provider.trading_days[-1] if args.day == "last" else _date.fromisoformat(args.day)
+    underlier = args.underlier or provider.underliers[0]
+    spec = registry.get(args.strategy)
+    feed = ReplayFeed(provider, day, underlier)
+    strategy = spec.factory(provider, **_parse_params(args.param))(underlier, feed.expiry, feed.strikes)
+    execution = _execution_from(args)
+    broker = PaperBroker(provider.multiplier(underlier), execution,
+                         RiskLimits(max_daily_loss=args.max_daily_loss, max_open_contracts=args.max_contracts),
+                         allow_short=strategy.allow_short)
+    runner = LiveRunner(strategy, feed, broker, execution, audit=AuditLog(args.audit_log),
+                        kill=KillSwitch(args.kill_file), state_path=args.state, adopt_existing=args.adopt)
+    s = runner.run()
+    print(f"{spec.label} · {underlier} · {day} · paper trading on {provider.name} data")
+    print(f"  net PnL {s.net_pnl:,.2f} {provider.unit} · {s.n_fills} fills · {s.n_rejections} rejections"
+          f"{' · HALTED by risk limit' if s.halted else ''}{' · KILLED' if s.killed else ''}")
+    if args.audit_log:
+        print(f"  audit log: {args.audit_log}")
+    return 0
+
+
+def _add_market_args(r) -> None:
+    r.add_argument("--provider", choices=["synthetic", "yahoo"], default="synthetic",
+                   help="synthetic: built-in simulator; yahoo: real bars from Yahoo Finance (needs the [data] extra)")
+    r.add_argument("--seed", type=int, default=7, help="synthetic market seed")
+    r.add_argument("--days", type=int, default=21, help="synthetic market length in trading days")
+    r.add_argument("--tickers", nargs="+", metavar="SYMBOL", help="Yahoo symbols, e.g. SPY QQQ  |  ^NSEI ^NSEBANK  |  RELIANCE.NS")
+    r.add_argument("--interval", default="5m", choices=["1m", "2m", "5m", "15m", "30m", "60m", "90m"], help="Yahoo bar size")
+    r.add_argument("--lookback", type=int, help="calendar days of Yahoo history (default 30, capped by what Yahoo keeps)")
+    r.add_argument("--iv-premium", type=float, default=0.10, help="implied vol = trailing realised vol * (1 + this)")
+    r.add_argument("--vol", type=float, help="fixed annualised implied vol instead of the trailing estimate")
+    r.add_argument("--expiry-weekday", type=int, default=4, help="weekly expiry day, 0=Mon … 4=Fri")
+    r.add_argument("--multiplier", type=float, help="contract multiplier (default 100 for USD, 1 otherwise)")
+
+
+def _add_exec_args(r) -> None:
+    r.add_argument("--param", action="append", default=[], metavar="KEY=VALUE", help="strategy parameter")
+    r.add_argument("--execution", choices=["instant", "default", "realistic"], default="default",
+                   help="fill model: instant (same-second, free), default (next-second, free), realistic (next-second + spread + fees)")
+    r.add_argument("--delay-s", type=int, help="override fill delay in seconds (0 = same-second)")
+    r.add_argument("--half-spread-bps", type=float, help="override half-spread, basis points of price")
+    r.add_argument("--min-half-spread", type=float, help="override minimum half-spread, in price units")
+    r.add_argument("--commission", type=float, help="override commission per contract")
+    r.add_argument("--max-daily-loss", type=float, help="halt and flatten at this daily loss (currency)")
+    r.add_argument("--max-contracts", type=int, help="cap on total contracts held")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,25 +171,28 @@ def main(argv: list[str] | None = None) -> int:
 
     r = sub.add_parser("run", help="run a backtest and print a summary")
     r.add_argument("strategy", help="strategy key (see `stratbt strategies`)")
-    r.add_argument("--provider", choices=["synthetic", "nse"], default="synthetic")
-    r.add_argument("--data-dir", help=f"NSE tick data folder (or set ${DEFAULT_DATA_ENV})")
-    r.add_argument("--seed", type=int, default=7, help="synthetic market seed")
-    r.add_argument("--days", type=int, default=21, help="synthetic market length in trading days")
+    _add_market_args(r)
     r.add_argument("--underliers", nargs="+")
     r.add_argument("--start", help="YYYY-MM-DD")
     r.add_argument("--end", help="YYYY-MM-DD")
-    r.add_argument("--param", action="append", default=[], metavar="KEY=VALUE", help="strategy parameter")
-    r.add_argument("--execution", choices=["instant", "default", "realistic"], default="default",
-                   help="fill model: instant (same-second, free), default (next-second, free), realistic (next-second + spread + fees)")
-    r.add_argument("--commission", type=float, help="override commission per contract")
-    r.add_argument("--max-daily-loss", type=float, help="halt and flatten at this daily loss (currency)")
-    r.add_argument("--max-contracts", type=int, help="cap on total contracts held")
+    _add_exec_args(r)
     r.add_argument("--pdf", help="write a PDF tearsheet to this path")
     r.set_defaults(func=cmd_run)
 
+    pp = sub.add_parser("paper", help="replay one session through the live runner with a paper broker")
+    pp.add_argument("strategy")
+    _add_market_args(pp)
+    _add_exec_args(pp)
+    pp.add_argument("--day", default="last", help="YYYY-MM-DD or 'last' (default)")
+    pp.add_argument("--underlier", help="which underlier to trade (default: the first)")
+    pp.add_argument("--audit-log", help="write a JSON-lines audit trail here")
+    pp.add_argument("--state", help="JSON file holding saved positions (reconciled on start)")
+    pp.add_argument("--kill-file", help="create this file to flatten everything and stop")
+    pp.add_argument("--adopt", action="store_true", help="start even if the broker holds unknown positions")
+    pp.set_defaults(func=cmd_paper)
+
     a = sub.add_parser("app", help="launch the Streamlit dashboard")
     a.add_argument("--port", type=int, default=8501)
-    a.add_argument("--data-dir", help="NSE tick data folder to offer in the dashboard")
     a.set_defaults(func=cmd_app)
 
     args = ap.parse_args(argv)

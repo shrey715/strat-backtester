@@ -53,6 +53,9 @@ class FixedWindowStraddleStrategy(BaseStrategy):
         self.exit_buffer_s = exit_buffer_s
         self._entered      = False
         self._entry_ts     = None
+        so, sc = self.SESSION_OPEN, self.SESSION_CLOSE
+        self._entry_s = so.hour * 3600 + so.minute * 60 + so.second + entry_delay_s
+        self._exit_s  = sc.hour * 3600 + sc.minute * 60 + sc.second - exit_buffer_s
 
     def _nearest_strike(self, futures_price: float) -> int:
         """
@@ -90,14 +93,10 @@ class FixedWindowStraddleStrategy(BaseStrategy):
             when the entry window opens and both legs have a price;
             otherwise empty.
         """
-        so, sc         = self.SESSION_OPEN, self.SESSION_CLOSE
-        session_open   = ts.replace(hour=so.hour, minute=so.minute, second=so.second, microsecond=0)
-        session_close  = ts.replace(hour=sc.hour, minute=sc.minute, second=sc.second, microsecond=0)
-        entry_deadline = session_open  + pd.Timedelta(seconds=self.entry_delay_s)
-        exit_deadline  = session_close - pd.Timedelta(seconds=self.exit_buffer_s)
+        sod = ts.hour * 3600 + ts.minute * 60 + ts.second
 
         # force-close
-        if ts >= exit_deadline and holdings:
+        if sod >= self._exit_s and holdings:
             return [Order(inst, "SELL") for inst in holdings]
 
         # already holding — do not roll, just hold
@@ -105,7 +104,7 @@ class FixedWindowStraddleStrategy(BaseStrategy):
             return []
 
         # only enter inside the window [entry_deadline, exit_deadline)
-        if ts < entry_deadline or ts >= exit_deadline:
+        if sod < self._entry_s or sod >= self._exit_s:
             return []
 
         # enter once

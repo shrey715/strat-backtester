@@ -30,6 +30,7 @@ class DayResult:
     fees: float = 0.0             # total fees paid (already deducted from final_pnl)
     rejections: list[Rejection] = field(default_factory=list)  # orders the broker refused
     multiplier: float = 1.0       # currency value of one price point per contract
+    slippage: float = 0.0         # spread cost vs mid (already inside fill prices / PnL)
 
 class BacktestResult:
     """
@@ -39,7 +40,7 @@ class BacktestResult:
     is typically built once and read a handful of times, not in a hot loop.
     """
 
-    def __init__(self, day_results: list[DayResult], unit: str = "pts"):
+    def __init__(self, day_results: list[DayResult], unit: str = "pts", meta: dict | None = None):
         """
         Parameters
         ----------
@@ -49,9 +50,13 @@ class BacktestResult:
             an appropriately-shaped empty result rather than raising).
         unit : str, default "pts"
             Label for PnL numbers ("pts" for index points, "USD", ...).
+        meta : dict, optional
+            Run description shown in reports: strategy, params, provider,
+            execution, risk. Purely informational.
         """
         self._results = day_results
         self.unit = unit
+        self.meta = dict(meta or {})
 
     @property
     def day_results(self) -> list[DayResult]:
@@ -66,7 +71,7 @@ class BacktestResult:
         pd.DataFrame
             One row per trade across all days/underliers, sorted by
             timestamp. Columns: timestamp, date, underlier, instrument,
-            expiry, strike, option_type, side, price, qty, fee. Empty (but
+            expiry, strike, option_type, side, price, qty, fee, slippage. Empty (but
             with these columns) if there are no trades.
         """
         rows = []
@@ -84,11 +89,12 @@ class BacktestResult:
                     "price": t.price,
                     "qty": t.qty,
                     "fee": t.fee,
+                    "slippage": t.slippage,
                 })
         if not rows:
             return pd.DataFrame(columns=[
                 "timestamp", "date", "underlier", "instrument", "expiry",
-                "strike", "option_type", "side", "price", "qty", "fee"
+                "strike", "option_type", "side", "price", "qty", "fee", "slippage"
             ])
         df = pd.DataFrame(rows).sort_values("timestamp").reset_index(drop=True)
         return df
@@ -223,6 +229,15 @@ class BacktestEngine:
         self.risk = risk or RiskLimits()
         self.flatten_at_close = flatten_at_close
 
+    def describe(self) -> dict:
+        """Plain-data description of this engine's setup (for reports)."""
+        return {
+            "provider": self.provider.name,
+            "execution": dict(vars(self.execution)),
+            "risk": dict(vars(self.risk)),
+            "flatten_at_close": self.flatten_at_close,
+        }
+
     def run(self, underlier: str, progress: ProgressCallback | None = None) -> BacktestResult:
         """
         Run one underlier across every trading day the provider knows about.
@@ -282,7 +297,7 @@ class BacktestEngine:
                 all_results.append(dr)
                 if progress:
                     progress(underlier, day, len(all_results), total)
-        return BacktestResult(all_results, unit=self.provider.unit)
+        return BacktestResult(all_results, unit=self.provider.unit, meta=self.describe())
 
     def run_day(self, day: date, underlier: str) -> DayResult:
         """
@@ -420,6 +435,7 @@ class BacktestEngine:
             fees=position.fees,
             rejections=list(broker.rejections),
             multiplier=multiplier,
+            slippage=position.slippage,
         )
 
     def _compute_mtm(

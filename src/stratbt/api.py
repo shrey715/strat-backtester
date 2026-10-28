@@ -44,4 +44,6 @@ def run_backtest(
     spec = registry.get(strategy)
     engine = BacktestEngine(provider, spec.factory(provider, **(params or {})),
                             execution=execution, risk=risk)
-    return engine.run_all(underliers, start_date, end_date, progress=progress)
+    result = engine.run_all(underliers, start_date, end_date, progress=progress)
+    result.meta.update(strategy=spec.label, strategy_key=spec.key, allow_short=spec.cls.allow_short, unlimited_risk=spec.cls.unlimited_risk, params=spec.resolve(**(params or {})))
+    return result

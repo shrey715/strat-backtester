@@ -1,52 +1,41 @@
-# streamlit_app/report/__init__.py
 """
-Options backtest PDF tearsheet package.
+Options backtest PDF tearsheet.
 
-Three-stage pipeline (AWS BI pattern):
-  1. data.py   — fetch:  pulls all numbers out of BacktestResult into ReportData
-  2. pages.py  — merge:  lays out matplotlib figures using a top-down cursor
-  3. __init__  — render: stamps chrome and exports each figure as a PDF page
+Three-stage pipeline:
+  data.py    fetch   — every number, table and sentence computed once from a BacktestResult
+  pages.py   layout  — composes pages from that data (positions only)
+  charts.py / layout.py / theme.py   draw — chart functions, page primitives, design tokens
 
 Public entry point: `build_pdf_report(result, strategy_name, period_label)`.
 """
-
 from io import BytesIO
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 from stratbt.engine import BacktestResult
+from stratbt.report import theme
+from stratbt.report.data import ReportData, build_report_data
+from stratbt.report.pages import build_all_pages
 
-from .data import ReportData, build_report_data
-from .pages import build_all_pages
-from . import widgets as w
 
-
-def build_pdf_report(
-    result: BacktestResult,
-    strategy_name: str,
-    period_label: str,
-) -> bytes:
+def build_pdf_report(result: BacktestResult, strategy_name: str = "", period_label: str = "") -> bytes:
     """
-    Full entry point: build a well-structured multi-page PDF tearsheet.
+    Build a multi-page PDF tearsheet and return its bytes (for
+    `st.download_button` or writing straight to a file).
 
-    Returns raw PDF bytes suitable for ``st.download_button`` or writing
-    directly to a file.  All heavy computation happens in build_report_data;
-    the pages/ widgets layers are pure layout/drawing with no pandas work.
+    The strategy name is taken from `result.meta` when the result came from
+    `run_backtest`; `strategy_name` is the fallback.
     """
-    data:  ReportData                    = build_report_data(result, strategy_name, period_label)
-    pages: list[tuple[plt.Figure, str]]  = build_all_pages(data)
-
-    total_pages = len(pages)
-    buffer      = BytesIO()
-
-    with PdfPages(buffer) as pdf:
-        for page_num, (fig, section) in enumerate(pages, start=1):
-            w.chrome(fig, section, page_num, total_pages,
-                     data.generated_at, data.strategy_name)
-            pdf.savefig(fig, dpi=150)
+    data = build_report_data(result, strategy_name, period_label)
+    pages = build_all_pages(data)
+    buffer = BytesIO()
+    with plt.rc_context(theme.RC), PdfPages(buffer, metadata={
+        "Title": f"{data.strategy_name} — backtest report", "Creator": f"stratbt {data.version}",
+    }) as pdf:
+        for fig, _section in pages:
+            pdf.savefig(fig)
             plt.close(fig)
-
     return buffer.getvalue()
 
 

@@ -7,39 +7,21 @@ options are priced with Black-Scholes at the matching second. It is a
 sandbox for developing and testing strategies and plumbing — results say
 nothing about real markets.
 """
-from datetime import date, datetime, time, timedelta
+from datetime import date, time, timedelta
 
 import numpy as np
 import pandas as pd
-from scipy.special import ndtr
 
-from stratbt.instruments import Instrument
-from stratbt.providers.base import DataProvider
+from stratbt.providers.modelled import TRADING_DAYS_PER_YEAR, ModelPricedProvider, bs_price  # noqa: F401
 
 # underlier -> (starting spot, strike step)
 DEFAULT_UNDERLIERS: dict[str, tuple[float, int]] = {
     "SPY": (450.0, 1),
     "QQQ": (380.0, 1),
 }
-_SECONDS_PER_YEAR = 365.25 * 86_400
-_TRADING_DAYS_PER_YEAR = 252
-_MAX_EXPIRY_WEEKS = 6
 
 
-def bs_price(spot: np.ndarray, strike: float, t_years: np.ndarray, vol: float,
-             rate: float, is_call: bool) -> np.ndarray:
-    """Vectorised Black-Scholes European option price."""
-    t = np.maximum(t_years, 1e-9)
-    sqrt_t = np.sqrt(t)
-    d1 = (np.log(spot / strike) + (rate + 0.5 * vol**2) * t) / (vol * sqrt_t)
-    d2 = d1 - vol * sqrt_t
-    disc = np.exp(-rate * t)
-    if is_call:
-        return spot * ndtr(d1) - strike * disc * ndtr(d2)
-    return strike * disc * ndtr(-d2) - spot * ndtr(-d1)
-
-
-class SyntheticProvider(DataProvider):
+class SyntheticProvider(ModelPricedProvider):
     """
     Parameters
     ----------
@@ -98,20 +80,22 @@ class SyntheticProvider(DataProvider):
     # ---- simulation ----------------------------------------------------
     def _simulate(self) -> None:
         n = len(self.session_grid(self._days[0]))
-        dt = 1.0 / (_TRADING_DAYS_PER_YEAR * n)
+        dt = 1.0 / (TRADING_DAYS_PER_YEAR * n)
         for k, (ul, (spot0, _step)) in enumerate(sorted(self._specs.items())):
             rng = np.random.default_rng([self.seed, k])
             spot = spot0
             for day in self._days:
-                day_vol = self.annual_vol * float(np.exp(rng.normal(0.0, 0.25)))
-                spot *= float(np.exp(rng.normal(0.0, 0.3 * day_vol / np.sqrt(_TRADING_DAYS_PER_YEAR))))
+                # lognormal day-to-day vol regime with E[vol^2] = annual_vol^2, so the
+                # market is fair on average (no built-in edge for long or short vol)
+                day_vol = self.annual_vol * float(np.exp(rng.normal(-0.25**2, 0.25)))
+                spot *= float(np.exp(rng.normal(0.0, 0.3 * day_vol / np.sqrt(TRADING_DAYS_PER_YEAR))))
                 z = rng.standard_normal(n)
                 logret = (-0.5 * day_vol**2) * dt + day_vol * np.sqrt(dt) * z
                 path = np.round(spot * np.exp(np.cumsum(logret)), 2)
                 spot = float(path[-1])
                 self._paths[(day, ul)] = pd.Series(path, index=self.session_grid(day), name=f"{ul}_underlying")
 
-    # ---- DataProvider --------------------------------------------------
+    # ---- ModelPricedProvider hooks ----------------------------------------
     @property
     def underliers(self) -> list[str]:
         return sorted(self._specs)
@@ -123,43 +107,14 @@ class SyntheticProvider(DataProvider):
     def multiplier(self, underlier: str) -> float:
         return 100.0
 
-    def _check(self, day: date, underlier: str) -> None:
-        if (day, underlier) not in self._paths:
-            raise ValueError(f"No data for day {day} and underlier {underlier}")
+    def _has(self, day: date, underlier: str) -> bool:
+        return (day, underlier) in self._paths
 
-    def _expiries(self, day: date) -> list[date]:
-        first = day + timedelta(days=(self.expiry_weekday - day.weekday()) % 7)
-        return [first + timedelta(weeks=i) for i in range(_MAX_EXPIRY_WEEKS)]
+    def _spot(self, day: date, underlier: str) -> pd.Series:
+        return self._paths[(day, underlier)]
 
-    def front_expiry(self, day: date, underlier: str) -> date:
-        self._check(day, underlier)
-        return self._expiries(day)[0]
+    def _iv(self, day: date, underlier: str) -> float:
+        return self.annual_vol * (1.0 + self.iv_premium)
 
-    def strikes(self, day: date, underlier: str, expiry: date) -> np.ndarray:
-        self._check(day, underlier)
-        if expiry not in self._expiries(day):
-            raise ValueError(f"No data for day {day}, underlier {underlier} and expiry {expiry}")
-        step = self._specs[underlier][1]
-        path = self._paths[(day, underlier)]
-        lo = int(np.floor(path.min() * 0.95 / step)) * step
-        hi = int(np.ceil(path.max() * 1.05 / step)) * step
-        return np.arange(lo, hi + step, step, dtype=int)
-
-    def underlying_prices(self, day: date, underlier: str) -> pd.Series:
-        self._check(day, underlier)
-        return self._paths[(day, underlier)].copy()
-
-    def option_prices(self, day: date, inst: Instrument) -> pd.Series | None:
-        if (day, inst.underlier) not in self._paths:
-            return None
-        if inst.expiry not in self._expiries(day):
-            return None
-        if inst.strike not in self.strikes(day, inst.underlier, inst.expiry):
-            return None
-        spot = self._paths[(day, inst.underlier)]
-        end = datetime.combine(inst.expiry, self.session_close) + timedelta(seconds=1)
-        t_years = (end - spot.index).total_seconds().to_numpy() / _SECONDS_PER_YEAR
-        px = bs_price(spot.to_numpy(), float(inst.strike), t_years,
-                      self.annual_vol * (1.0 + self.iv_premium), self.rate,
-                      inst.option_type == "CE")
-        return pd.Series(np.maximum(np.round(px, 2), 0.01), index=spot.index, name=inst.filename)
+    def _strike_step(self, underlier: str) -> int:
+        return self._specs[underlier][1]

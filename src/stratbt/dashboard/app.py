@@ -1,793 +1,544 @@
 # src/stratbt/dashboard/app.py
+import importlib.util
 import os
-from datetime import date
-from pathlib import Path
+import shlex
+from datetime import datetime
 
-import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
-import stratbt.metrics as metrics
+from stratbt.dashboard import charts
 from stratbt.engine import BacktestEngine, BacktestResult
 from stratbt.execution import ExecutionModel
-from stratbt.palette import SERIES_COLORS
-from stratbt.position import Position
-from stratbt.providers import DataProvider, NSETickProvider, SyntheticProvider
-from stratbt.report import build_pdf_report
+from stratbt.providers import DataProvider, SyntheticProvider, YahooFinanceProvider
+from stratbt.providers.yahoo import INTERVAL_MAX_DAYS
+from stratbt.report import build_pdf_report, theme as T
+from stratbt.report.data import build_report_data
 from stratbt.risk import RiskLimits
 from stratbt.strategy import registry
 
-st.set_page_config(
-    page_title="Strategy Backtester",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Strategy Backtester", layout="wide", initial_sidebar_state="expanded")
 
-DATA_DIR_ENV = "STRATBT_DATA_DIR"
-DEFAULT_NSE_DIR = Path(os.environ.get(DATA_DIR_ENV, "data/allData"))
+MAX_RUNS = 6
+HAS_YAHOO = importlib.util.find_spec("yfinance") is not None
+POPULAR = {
+    "US ETFs": ["SPY", "QQQ", "IWM", "DIA"],
+    "US stocks": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN"],
+    "India (NSE)": ["^NSEI", "^NSEBANK", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS"],
+}
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+SOURCES = ["Yahoo Finance", "Synthetic"]
+# STRATBT_SOURCE=synthetic|yahoo picks the starting data source (e.g. offline containers, tests)
+_env_source = {"synthetic": "Synthetic", "yahoo": "Yahoo Finance"}.get(os.environ.get("STRATBT_SOURCE", "").lower())
+DEFAULT_SOURCE = _env_source or (SOURCES[0] if HAS_YAHOO else "Synthetic")
 
-POSITIVE_COLOR = "#2ca02c"
-NEGATIVE_COLOR = "#d62728"
-GRID_COLOR = "#d5d5d5"
+PRESETS = {
+    "Next-second": ExecutionModel(),
+    "Instant": ExecutionModel.instant(),
+    "Realistic": ExecutionModel.realistic(),
+}
+PRESET_HELP = {
+    "Next-second": "Fills one second after the decision, no costs. Removes look-ahead; nothing else.",
+    "Instant": "Fills in the decision second at the mid price. Optimistic: reproduces the original behaviour.",
+    "Realistic": "Next-second fills, 25 bps half-spread (1c floor) and $0.65 per contract.",
+}
+EXAMPLES = [
+    ("Short strangle", "short_strangle", {"width": 3}, "Realistic",
+     "Sell a call and a put three strikes out and hold. Premium collection with open-ended risk."),
+    ("Iron condor", "iron_condor", {}, "Realistic",
+     "The same idea with protective wings, so the loss is capped."),
+    ("Rolling straddle", "atm_straddle", {}, "Realistic",
+     "Trades thousands of times a day. Watch what costs do to it."),
+]
 
+if st.session_state.pop("_scroll_top", False):
+    st.html("""<script>
+      const d = window.parent.document;
+      (d.querySelector('[data-testid="stMain"]') || d.querySelector('section.main') || d.documentElement).scrollTo({top: 0});
+    </script>""", unsafe_allow_javascript=True)
 
-def _u() -> str:
-    """Unit label of the result currently being displayed."""
-    return st.session_state.get("unit", "pts")
-
-
-def _hex_to_rgba(hex_color: str, alpha: float) -> str:
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-def _layout(title: str, y_title: str, height: int = 400) -> dict:
-    """
-    Shared Plotly layout for every chart in the app.
-    Legend sits below the plot with a wide bottom margin so it never
-    collides with the title or crowded date tick labels.
-    """
-    return dict(
-        title=dict(text=title, font=dict(size=14), pad=dict(b=10)),
-        yaxis_title=y_title,
-        hovermode="x unified",
-        height=height,
-        template="plotly_white",
-        margin=dict(l=60, r=30, t=55, b=90),
-        legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="center", x=0.5),
-        xaxis=dict(tickangle=-30),
-    )
+st.html("""
+<style>
+  .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1400px; }
+  [data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: 650; }
+  [data-testid="stMetricLabel"] p { font-size: .72rem; letter-spacing: .04em; text-transform: uppercase; opacity: .75; }
+  button[data-baseweb="tab"] { font-size: .95rem; }
+  h1 { font-weight: 700; letter-spacing: -.02em; }
+  [data-testid="stSidebar"] [data-testid="stExpander"] { border-color: rgba(128,128,128,.25); }
+</style>
+""")
 
 
 # ---------------------------------------------------------------------------
-# Chart functions
+# data + engine helpers
 # ---------------------------------------------------------------------------
 
-def plotly_cumulative_pnl(result: BacktestResult) -> go.Figure:
-    daily = result.daily_pnl.fillna(0)
-    cum   = daily.cumsum()
-    combo = cum.sum(axis=1)
-
-    fig = go.Figure()
-    for col in cum.columns:
-        fig.add_trace(go.Scatter(
-            x=cum.index, y=cum[col], name=col, mode="lines",
-            line=dict(width=2.5, color=SERIES_COLORS.get(col, "#888")),
-        ))
-    fig.add_trace(go.Scatter(
-        x=combo.index, y=combo.values, name="Combined", mode="lines",
-        line=dict(width=3, dash="dash", color=SERIES_COLORS["Combined"]),
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Cumulative PnL", f"PnL ({_u()})"))
-    return fig
-
-
-def plotly_daily_pnl(result: BacktestResult) -> go.Figure:
-    daily = result.daily_pnl.fillna(0).reset_index().melt(
-        id_vars="date", var_name="underlier", value_name="pnl"
-    )
-    fig = px.bar(
-        daily, x="date", y="pnl", color="underlier", barmode="group",
-        color_discrete_map=SERIES_COLORS,
-        labels={"pnl": f"PnL ({_u()})", "date": ""},
-    )
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Daily PnL by Underlier", f"PnL ({_u()})"))
-    return fig
-
-
-def plotly_drawdown(result: BacktestResult) -> go.Figure:
-    fig = go.Figure()
-    for col in result.daily_pnl.fillna(0).columns:
-        cum   = result.daily_pnl[col].fillna(0).cumsum()
-        dd    = -(cum.cummax() - cum)
-        color = SERIES_COLORS.get(col, "#888")
-        fig.add_trace(go.Scatter(
-            x=cum.index, y=dd.values, name=col, mode="lines",
-            line=dict(width=2, color=color),
-            fill="tozeroy", fillcolor=_hex_to_rgba(color, 0.12),
-        ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Drawdown", f"Drawdown ({_u()})"))
-    return fig
-
-
-def plotly_rolling_sharpe(result: BacktestResult, window: int = 5) -> go.Figure:
-    daily = result.daily_pnl.fillna(0)
-    rs    = (daily.rolling(window).mean() / daily.rolling(window).std()) * np.sqrt(252)
-
-    fig = go.Figure()
-    for col in rs.columns:
-        fig.add_trace(go.Scatter(
-            x=rs.index, y=rs[col], name=col, mode="lines",
-            line=dict(width=2.5, color=SERIES_COLORS.get(col, "#888")),
-        ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout(f"Rolling {window}-Day Sharpe Ratio", "Sharpe (annualized)"))
-    return fig
-
-
-def plotly_rolls_per_day(result: BacktestResult) -> go.Figure:
-    rpd = metrics.rolls_per_day(result)
-    fig = px.bar(
-        rpd, x="date", y="rolls", color="underlier", barmode="group",
-        color_discrete_map=SERIES_COLORS,
-        labels={"rolls": "Rolls", "date": ""},
-    )
-    fig.update_layout(**_layout("Rolls per Day", "Number of rolls"))
-    return fig
-
-
-def plotly_intraday_mtm(dr) -> go.Figure:
-    y = dr.mtm.values
-    x = dr.mtm.index
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=x, y=np.where(y >= 0, y, 0),
-        fill="tozeroy", fillcolor=_hex_to_rgba(POSITIVE_COLOR, 0.15),
-        line=dict(width=0), showlegend=False, name="Profit",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=np.where(y < 0, y, 0),
-        fill="tozeroy", fillcolor=_hex_to_rgba(NEGATIVE_COLOR, 0.15),
-        line=dict(width=0), showlegend=False, name="Loss",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=y, mode="lines",
-        line=dict(color=SERIES_COLORS["Combined"], width=2), name="MTM",
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout(
-        f"Intraday MTM — {dr.underlier} {dr.date}  ({dr.final_pnl:+.1f} {_u()})",
-        f"MTM PnL ({_u()})", height=360,
-    ))
-    return fig
-
-
-def plotly_strike_held(dr) -> go.Figure:
-    log = dr.holdings_log
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=log.index, y=log["strike"], mode="lines", line_shape="hv",
-        line=dict(color=SERIES_COLORS["NIFTY"], width=2), name="Strike",
-    ))
-    fig.update_layout(**_layout(f"Strike Held — {dr.underlier} {dr.date}", "Strike", height=360))
-    visited = sorted(log["strike"].dropna().unique().astype(int))
-    fig.update_yaxes(tickvals=visited, tickfont=dict(size=9))
-    return fig
-
-
-def plotly_cost_sensitivity(result: BacktestResult) -> go.Figure:
-    cs     = metrics.cost_sensitivity(result)
-    colors = [NEGATIVE_COLOR if v < 0 else POSITIVE_COLOR for v in cs["net_pnl"]]
-    fig    = go.Figure(go.Bar(
-        x=cs["cost_bps"].astype(str), y=cs["net_pnl"], marker_color=colors,
-        text=cs["net_pnl"].round(0).astype(int), textposition="outside",
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Net PnL vs Transaction Cost", f"Net PnL ({_u()})"))
-    fig.update_xaxes(title_text="Cost (bps per trade)", tickangle=0)
-    return fig
-
-
-def plotly_pnl_histogram(result: BacktestResult, show_var: bool = False) -> go.Figure:
-    daily = result.daily_pnl.fillna(0)
-    fig   = go.Figure()
-    for col in daily.columns:
-        fig.add_trace(go.Histogram(
-            x=daily[col], name=col, nbinsx=15,
-            marker_color=SERIES_COLORS.get(col, "#888"), opacity=0.75,
-        ))
-    fig.add_vline(x=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    if show_var:
-        var = metrics.value_at_risk(result)
-        for col in daily.columns:
-            fig.add_vline(
-                x=-var[col], line_dash="dash", line_color=NEGATIVE_COLOR, line_width=1.5,
-                annotation_text=f"{col} VaR95", annotation_font_size=9,
-            )
-    fig.update_layout(**_layout("Daily PnL Distribution", "Frequency"), barmode="overlay")
-    fig.update_xaxes(title_text=f"Daily PnL ({_u()})")
-    return fig
-
-
-def plotly_sharpe_ci(result: BacktestResult) -> go.Figure:
-    ci  = metrics.sharpe_confidence_interval(result)
-    fig = go.Figure(go.Bar(
-        x=ci.index, y=ci["sharpe"],
-        error_y=dict(
-            type="data", symmetric=False,
-            array=ci["ci_high"] - ci["sharpe"],
-            arrayminus=ci["sharpe"] - ci["ci_low"],
-        ),
-        marker_color=[SERIES_COLORS.get(ul, "#888") for ul in ci.index],
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Sharpe Ratio (95% Bootstrap CI)", "Sharpe (annualized)"))
-    fig.update_xaxes(tickangle=0)
-    return fig
-
-
-def plotly_pnl_waterfall(result: BacktestResult) -> go.Figure:
-    daily  = result.daily_pnl.fillna(0).sum(axis=1)
-    dates  = [str(d) for d in daily.index]
-    values = daily.values.tolist()
-    fig = go.Figure(go.Waterfall(
-        x=dates, y=values, measure=["relative"] * len(values),
-        connector=dict(line=dict(color=GRID_COLOR, width=0.5)),
-        increasing=dict(marker_color=POSITIVE_COLOR),
-        decreasing=dict(marker_color=NEGATIVE_COLOR),
-    ))
-    fig.update_layout(**_layout("Daily PnL Waterfall (Combined)", f"Cumulative PnL ({_u()})"))
-    return fig
+@st.cache_resource(show_spinner="Preparing market data…", ttl=3600)
+def _make_provider(kind: str, tickers: tuple, interval: str, lookback: int, iv_premium: float,
+                   expiry_weekday: int, multiplier: float, seed: int, n_days: int) -> DataProvider:
+    if kind == "Synthetic":
+        return SyntheticProvider(n_days=n_days, seed=seed)
+    return YahooFinanceProvider(list(tickers), interval=interval, lookback_days=lookback, iv_premium=iv_premium,
+                                expiry_weekday=expiry_weekday, multiplier=multiplier or None)
 
 
 @st.cache_data(show_spinner=False)
-def _underlying_cached(_provider: DataProvider, provider_key: str, day: date, underlier: str) -> pd.Series:
+def _underlying(_provider: DataProvider, provider_key: str, day, underlier: str) -> pd.Series:
     return _provider.underlying_prices(day, underlier)
 
 
-def _underlying(dr) -> pd.Series:
-    return _underlying_cached(st.session_state["provider"], st.session_state["provider_key"],
-                              dr.date, dr.underlier)
+def _apply_preset() -> None:
+    m = PRESETS[st.session_state["preset"] or "Next-second"]
+    st.session_state.update(delay_s=m.delay_s, spread_bps=m.half_spread_bps, commission=m.commission_per_contract)
 
 
-def plotly_futures_through_day(dr) -> go.Figure:
-    color = SERIES_COLORS.get(dr.underlier, "#888")
-    fut   = _underlying(dr)
-    fig   = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=fut.index, y=fut.values, mode="lines", name="Futures",
-        line=dict(color=color, width=2),
-    ))
-    fig.update_layout(**_layout(f"Underlying Price — {dr.underlier} {dr.date}", f"Price ({_u()})", height=340))
-    return fig
+def _money(v, unit, **kw) -> str:
+    return T.fmoney(v, unit, **kw)
 
 
-def plotly_futures_vs_strike(dr) -> go.Figure:
-    color = SERIES_COLORS.get(dr.underlier, "#888")
-    fut   = _underlying(dr)
-    log   = dr.holdings_log
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=fut.index, y=fut.values, name="Underlying", mode="lines",
-        line=dict(color="#999999", width=1.5), yaxis="y1",
-    ))
-    if not log.empty:
-        fig.add_trace(go.Scatter(
-            x=log.index, y=log["strike"], name="Strike", mode="lines", line_shape="hv",
-            line=dict(color=color, width=2.5), yaxis="y2",
-        ))
-    layout = _layout(f"Underlying vs Strike — {dr.underlier} {dr.date}", "Underlying", height=360)
-    layout["margin"] = dict(l=60, r=70, t=55, b=90)
-    fig.update_layout(**layout, yaxis2=dict(title="Strike", overlaying="y", side="right", showgrid=False))
-    return fig
+def _esc(s: str) -> str:
+    """Streamlit markdown renders $...$ as LaTeX; money strings must be escaped."""
+    return s.replace("$", "\\$")
 
 
-def plotly_leg_prices(dr) -> go.Figure:
-    log = dr.holdings_log
-    if log.empty:
-        return go.Figure()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=log.index, y=log["ce_mtm_price"], name="CE", mode="lines",
-        line=dict(color=SERIES_COLORS["NIFTY"], width=1.5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=log.index, y=log["pe_mtm_price"], name="PE", mode="lines",
-        line=dict(color=SERIES_COLORS["BANKNIFTY"], width=1.5),
-    ))
-    combined = log["ce_mtm_price"] + log["pe_mtm_price"]
-    fig.add_trace(go.Scatter(
-        x=log.index, y=combined, name="Total", mode="lines",
-        line=dict(color=SERIES_COLORS["Combined"], width=2.5, dash="dash"),
-    ))
-    fig.update_layout(**_layout(f"Option Prices — {dr.underlier} {dr.date}", "Price", height=340))
-    return fig
-
-
-def plotly_realized_staircase(dr) -> go.Figure:
-    """
-    MTM equity vs the realized-PnL staircase. The staircase steps whenever a
-    position is (partly) closed; the gap to the MTM line is unrealized PnL.
-    """
-    trades = dr.trades
-    if not trades:
-        return go.Figure()
-
-    ledger     = Position(multiplier=dr.multiplier, allow_short=True)
-    timestamps = [dr.mtm.index[0]]
-    realized   = [0.0]
-    for t in sorted(trades, key=lambda x: x.timestamp):
-        (ledger.buy if t.side == "BUY" else ledger.sell)(t.timestamp, t.instrument, t.price, t.qty, fee=t.fee)
-        timestamps.append(t.timestamp)
-        realized.append(ledger.net_realized)
-    timestamps.append(dr.mtm.index[-1])
-    realized.append(ledger.net_realized)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dr.mtm.index, y=dr.mtm.values, name="MTM", mode="lines",
-        line=dict(color=SERIES_COLORS["NIFTY"], width=1.5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=timestamps, y=realized, name="Realized", mode="lines", line_shape="hv",
-        line=dict(color=POSITIVE_COLOR, width=2.5, dash="dash"),
-    ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout(f"MTM vs Realized — {dr.underlier} {dr.date}", f"PnL ({_u()})", height=360))
-    return fig
-
-
-def plotly_roll_interval_dist(result: BacktestResult) -> go.Figure:
-    fig = go.Figure()
-    for ul in sorted({dr.underlier for dr in result.day_results}):
-        gaps = []
-        for dr in result.day_results:
-            if dr.underlier != ul or dr.holdings_log.empty:
-                continue
-            log_r = dr.holdings_log.reset_index()
-            rolls = log_r[log_r["strike"] != log_r["strike"].shift(1)].iloc[1:]
-            gaps.extend(rolls["timestamp"].diff().dt.total_seconds().dropna().tolist())
-        fig.add_trace(go.Histogram(
-            x=gaps, name=ul, nbinsx=50,
-            marker_color=SERIES_COLORS.get(ul, "#888"), opacity=0.7,
-        ))
-    fig.update_layout(**_layout("Seconds Between Rolls", "Frequency"), barmode="overlay")
-    fig.update_xaxes(title_text="Seconds between rolls", range=[0, 300], tickangle=0)
-    return fig
-
-
-def plotly_morning_vs_afternoon(result: BacktestResult) -> go.Figure:
-    df  = metrics.morning_afternoon_split(result.day_results)
-    fig = go.Figure()
-    for ul in df["underlier"].unique():
-        sub   = df[df["underlier"] == ul]
-        color = SERIES_COLORS.get(ul, "#888")
-        fig.add_trace(go.Bar(
-            x=[str(d) for d in sub["date"]], y=sub["morning_pnl"],
-            name=f"{ul} AM", marker_color=color, opacity=0.9,
-        ))
-        fig.add_trace(go.Bar(
-            x=[str(d) for d in sub["date"]], y=sub["afternoon_pnl"],
-            name=f"{ul} PM", marker_color=color, opacity=0.5,
-        ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Morning vs Afternoon PnL", f"PnL ({_u()})"), barmode="group")
-    return fig
-
-
-def plotly_pnl_by_weekday(result: BacktestResult) -> go.Figure:
-    df  = metrics.pnl_by_weekday(result)
-    fig = px.bar(
-        df, x="weekday", y="avg_pnl", color="underlier", barmode="group",
-        color_discrete_map=SERIES_COLORS,
-        labels={"weekday": "", "avg_pnl": f"Average PnL ({_u()})"},
-    )
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Average PnL by Day of Week", f"Avg PnL ({_u()})"))
-    fig.update_xaxes(tickangle=0)
-    return fig
-
-
-def plotly_expiry_day_comparison(result: BacktestResult) -> go.Figure:
-    df  = metrics.expiry_day_pnl(result)
-    fig = px.bar(
-        df, x="underlier", y="avg_pnl", color="day_type", barmode="group",
-        color_discrete_map={"Expiry day": NEGATIVE_COLOR, "Non-expiry": SERIES_COLORS["Combined"]},
-        text="count",
-        labels={"avg_pnl": f"Average PnL ({_u()})", "count": "N days"},
-    )
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Expiry vs Non-Expiry Days", f"Avg PnL ({_u()})"))
-    fig.update_xaxes(tickangle=0)
-    return fig
-
-
-def plotly_avg_intraday_mtm(result: BacktestResult) -> go.Figure:
-    avg_df = metrics.avg_intraday_mtm(result)
-    fig    = go.Figure()
-    for col in avg_df.columns:
-        fig.add_trace(go.Scatter(
-            x=[str(tt) for tt in avg_df.index], y=avg_df[col], name=col, mode="lines",
-            line=dict(color=SERIES_COLORS.get(col, "#888"), width=2.5),
-        ))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout("Average Intraday MTM (All Days)", f"PnL ({_u()})"))
-    fig.update_xaxes(nticks=8, tickangle=0)
-    return fig
-
-
-def plotly_cross_underlier_scatter(result: BacktestResult) -> go.Figure:
-    daily  = result.daily_pnl.fillna(0)
-    ax, ay = daily.columns[0], daily.columns[1]
-    corr   = daily[ax].corr(daily[ay])
-    fig    = px.scatter(
-        daily, x=ax, y=ay, trendline="ols",
-        labels={ax: f"{ax} daily PnL", ay: f"{ay} daily PnL"},
-    )
-    fig.update_traces(marker=dict(color=SERIES_COLORS[ax], size=8))
-    fig.add_hline(y=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.add_vline(x=0, line_dash="dot", line_color=GRID_COLOR, line_width=1)
-    fig.update_layout(**_layout(f"{ax} vs {ay} Daily PnL  (r = {corr:.2f})", f"{ay} PnL ({_u()})"))
-    fig.update_xaxes(tickangle=0)
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Data source
-# ---------------------------------------------------------------------------
-
-@st.cache_resource(show_spinner="Preparing market data…")
-def _make_provider(kind: str, nse_dir: str, seed: int, n_days: int) -> DataProvider:
-    if kind == "Synthetic market":
-        return SyntheticProvider(n_days=n_days, seed=seed)
-    return NSETickProvider(nse_dir)
-
-
-def _nse_available() -> bool:
-    return DEFAULT_NSE_DIR.is_dir() and any(DEFAULT_NSE_DIR.glob("NSE_*"))
-
-
-# ---------------------------------------------------------------------------
-# Sidebar
-# ---------------------------------------------------------------------------
-
-EXEC_PRESETS = {
-    "Next-second, no costs": ExecutionModel(),
-    "Instant fills, no costs": ExecutionModel.instant(),
-    "Realistic costs": ExecutionModel.realistic(),
-}
-
-with st.sidebar:
-    st.header("Configuration")
-
-    st.subheader("Data")
-    kinds = ["Synthetic market", "NSE tick data"]
-    kind = st.radio("Source", kinds, index=1 if _nse_available() else 0, horizontal=True,
-                    label_visibility="collapsed")
-    nse_dir, seed, n_days = str(DEFAULT_NSE_DIR), 7, 21
-    if kind == "Synthetic market":
-        seed   = st.number_input("Seed", 0, 10_000, 7, help="Same seed = same market")
-        n_days = st.slider("Trading days", 5, 60, 21)
+def _cli_command(strategy_key, params, src, underliers, start, end, execution, risk) -> str:
+    parts = ["stratbt", "run", strategy_key]
+    if src["kind"] == "Synthetic":
+        parts += ["--provider", "synthetic", "--seed", str(src["seed"]), "--days", str(src["n_days"])]
     else:
-        nse_dir = st.text_input("Data folder", nse_dir,
-                                help="Folder containing NSE_YYYYMMDD day directories")
+        parts += ["--provider", "yahoo", "--tickers", *src["tickers"], "--interval", src["interval"],
+                  "--lookback", str(src["lookback"]), "--iv-premium", f"{src['iv_premium']:g}",
+                  "--expiry-weekday", str(src["expiry_weekday"])]
+        if src["multiplier"]:
+            parts += ["--multiplier", f"{src['multiplier']:g}"]
+    parts += ["--underliers", *underliers]
+    if start:
+        parts += ["--start", start.isoformat()]
+    if end:
+        parts += ["--end", end.isoformat()]
+    parts += [f"--param={k}={v:g}" for k, v in params.items()]
+    parts += ["--delay-s", str(execution.delay_s)]
+    if execution.half_spread_bps:
+        parts += ["--half-spread-bps", f"{execution.half_spread_bps:g}"]
+    if execution.min_half_spread:
+        parts += ["--min-half-spread", f"{execution.min_half_spread:g}"]
+    if execution.commission_per_contract:
+        parts += ["--commission", f"{execution.commission_per_contract:g}"]
+    if risk.max_daily_loss:
+        parts += ["--max-daily-loss", f"{risk.max_daily_loss:g}"]
+    if risk.max_open_contracts:
+        parts += ["--max-contracts", str(risk.max_open_contracts)]
+    return " ".join(shlex.quote(p) for p in parts)
 
+
+# ---------------------------------------------------------------------------
+# sidebar
+# ---------------------------------------------------------------------------
+
+st.session_state.setdefault("runs", [])
+st.session_state.setdefault("run_counter", 0)
+st.session_state.setdefault("delay_s", 1)
+st.session_state.setdefault("spread_bps", 0.0)
+st.session_state.setdefault("commission", 0.0)
+
+sb = st.sidebar
+sb.markdown("### Strategy Backtester")
+run_slot = sb.container()
+
+with sb.expander("1 · Market data", expanded=True):
+    kind = st.segmented_control("Source", SOURCES, default=DEFAULT_SOURCE,
+                                key="source", label_visibility="collapsed") or SOURCES[-1]
+    src = dict(kind=kind, tickers=(), interval="5m", lookback=30, iv_premium=0.10, expiry_weekday=4,
+               multiplier=0.0, seed=7, n_days=21)
+    if kind == "Synthetic":
+        st.caption("A seeded random market with Black–Scholes options. No download needed; "
+                   "results say nothing about real markets.")
+        c1, c2 = st.columns(2)
+        src["seed"] = int(c1.number_input("Seed", 0, 99_999, 7, key="seed", help="Same seed, same market."))
+        src["n_days"] = int(c2.number_input("Days", 5, 120, 21, key="ndays"))
+    elif not HAS_YAHOO:
+        st.error("Yahoo Finance support is not installed.  `pip install 'strat-backtester[data]'`")
+        st.stop()
+    else:
+        options = [t for group in POPULAR.values() for t in group]
+        src["tickers"] = tuple(st.multiselect(
+            "Tickers", options, default=["SPY"], key="tickers", accept_new_options=True,
+            help="Any Yahoo Finance symbol: US (SPY, AAPL), India (^NSEI, RELIANCE.NS), and more. "
+                 "Use one market per run: tickers must share trading hours."))
+        c1, c2 = st.columns(2)
+        src["interval"] = c1.selectbox("Bar size", ["1m", "5m", "15m", "30m", "60m"], index=1, key="interval")
+        cap = INTERVAL_MAX_DAYS[src["interval"]]
+        src["lookback"] = int(c2.number_input("Days back", 5, cap, min(30, cap), key=f"lookback_{src['interval']}",
+                                              help=f"Yahoo keeps about {cap} days of {src['interval']} bars."))
+        if st.toggle("Option pricing assumptions", key="adv_pricing"):
+            src["iv_premium"] = st.slider("Implied vol above realised", 0, 50, 10, 5, key="iv_prem",
+                                          help="Implied vol = trailing realised vol × (1 + this).") / 100
+            src["expiry_weekday"] = WEEKDAYS.index(st.selectbox("Weekly expiry", WEEKDAYS, index=4, key="expday"))
+            src["multiplier"] = float(st.number_input("Contract multiplier (0 = auto)", 0.0, 100_000.0, 0.0, key="mult",
+                                                      help="Auto: 100 for USD underlyings, 1 (index points) otherwise."))
+        st.caption("Underlying prices are **real** Yahoo bars. Option prices are **modelled** (Black–Scholes on "
+                   "trailing realised volatility): Yahoo has no historical option quotes.")
     try:
-        provider = _make_provider(kind, nse_dir, int(seed), int(n_days))
-        provider_key = f"{kind}|{nse_dir}|{seed}|{n_days}"
-    except (FileNotFoundError, ValueError) as e:
+        if kind == "Yahoo Finance" and not src["tickers"]:
+            st.info("Pick at least one ticker.")
+            st.stop()
+        provider = _make_provider(kind, src["tickers"], src["interval"], src["lookback"], src["iv_premium"],
+                                  src["expiry_weekday"], src["multiplier"], src["seed"], src["n_days"])
+        provider_key = repr(src)
+    except (ValueError, ImportError, OSError) as e:
         st.error(str(e))
         st.stop()
     all_days = provider.trading_days
+    st.caption(f"{len(all_days)} trading days · {provider.session_open:%H:%M}–{provider.session_close:%H:%M} · PnL in {provider.unit}")
 
-    st.divider()
-    st.subheader("Strategy")
+with sb.expander("2 · Strategy", expanded=True):
     specs = registry.available()
-    strategy_key = st.selectbox("Strategy", list(specs), format_func=lambda k: specs[k].label,
+    strategy_key = st.selectbox("Strategy", list(specs), format_func=lambda k: specs[k].label, key="strategy",
                                 label_visibility="collapsed")
     spec = specs[strategy_key]
     st.caption(spec.description)
-
     strategy_params: dict = {}
     for ps in spec.params:
         cast = int if ps.is_int else float
-        strategy_params[ps.name] = st.slider(
-            ps.label or ps.name, cast(ps.min), cast(ps.max), cast(ps.default), cast(ps.step)
-        )
+        strategy_params[ps.name] = st.slider(ps.label or ps.name, cast(ps.min), cast(ps.max), cast(ps.default),
+                                             cast(ps.step), key=f"param_{strategy_key}_{ps.name}")
 
-    st.divider()
-    st.subheader("Universe")
-    underliers = st.multiselect("Underliers", provider.underliers, default=provider.underliers)
-
-    _fmt = lambda d: d.strftime("%b %d")
-    if all_days:
-        col_from, col_to = st.columns(2)
-        start_date = col_from.selectbox("From", all_days, index=0, format_func=_fmt)
-        end_date   = col_to.selectbox("To", all_days, index=len(all_days) - 1, format_func=_fmt)
-        if start_date > end_date:
-            start_date, end_date = end_date, start_date
-        selected_days = [d for d in all_days if start_date <= d <= end_date]
+with sb.expander("3 · Universe & period", expanded=False):
+    # keyed by the data source so the selection resets when the available underliers change
+    underliers = st.multiselect("Underliers", provider.underliers, default=provider.underliers,
+                                key=f"underliers_{abs(hash(provider_key)) % 10**8}")
+    if len(all_days) > 1:
+        start_date, end_date = st.select_slider("Period", all_days, value=(all_days[0], all_days[-1]),
+                                                format_func=lambda d: d.strftime("%b %d"), key="period")
     else:
-        start_date, end_date = None, None
-        selected_days = []
+        start_date = end_date = all_days[0] if all_days else None
+    selected_days = [d for d in all_days if start_date and start_date <= d <= end_date]
+    st.caption(f"{len(selected_days)} days selected")
 
+with sb.expander("4 · Execution & risk", expanded=False):
+    st.segmented_control("Fill model", list(PRESETS), default="Next-second", key="preset",
+                         on_change=_apply_preset, label_visibility="collapsed")
+    st.caption(_esc(PRESET_HELP.get(st.session_state.get("preset") or "Next-second", "")))
+    delay_s = st.number_input("Fill delay (s)", 0, 30, key="delay_s",
+                              help="Seconds between decision and fill. 0 = same-second (optimistic). "
+                                   "While orders are in flight the strategy is not asked for new ones.")
+    spread_bps = st.number_input("Half-spread (bps of price)", 0.0, 1000.0, step=5.0, key="spread_bps")
+    commission = st.number_input("Commission per contract", 0.0, 100.0, step=0.05, key="commission")
     st.divider()
-    with st.expander("Execution & risk", expanded=False):
-        preset = st.selectbox("Fill model", list(EXEC_PRESETS))
-        base = EXEC_PRESETS[preset]
-        delay_s = st.number_input("Fill delay (s)", 0, 30, base.delay_s,
-                                  help="Seconds between decision and fill. 0 = same-second (optimistic).")
-        spread_bps = st.number_input("Half-spread (bps)", 0.0, 1000.0, base.half_spread_bps, 5.0)
-        commission = st.number_input("Commission / contract", 0.0, 100.0, base.commission_per_contract, 0.05)
-        max_loss   = st.number_input("Max daily loss (0 = off)", 0.0, 1e9, 0.0, 100.0,
-                                     help="Flatten and halt for the day once net loss reaches this amount.")
-        max_open   = st.number_input("Max open contracts (0 = off)", 0, 10_000, 0)
+    max_loss = st.number_input("Max daily loss (0 = off)", 0.0, 1e9, 0.0, 100.0, key="max_loss",
+                               help="Flatten everything and stop trading for the day once net loss reaches this.")
+    max_open = st.number_input("Max open contracts (0 = off)", 0, 10_000, 0, key="max_open")
 
-    st.divider()
-    run_button = st.button(
-        "Run Backtest", type="primary", width="stretch",
-        disabled=len(underliers) == 0 or len(selected_days) == 0,
-    )
-    st.caption(f"{len(all_days)} trading days · {provider.name} · PnL in {provider.unit}")
-
-# ---------------------------------------------------------------------------
-# Header
-# ---------------------------------------------------------------------------
-
-st.title("Strategy Backtester")
-st.divider()
-
-# ---------------------------------------------------------------------------
-# Run backtest
-# ---------------------------------------------------------------------------
-
-if run_button:
-    execution = ExecutionModel(
-        delay_s=int(delay_s), half_spread_bps=float(spread_bps),
-        min_half_spread=base.min_half_spread if spread_bps > 0 else 0.0,
-        commission_per_contract=float(commission), commission_bps=base.commission_bps,
-    )
-    risk = RiskLimits(max_daily_loss=max_loss or None, max_open_contracts=int(max_open) or None)
-    engine  = BacktestEngine(provider, spec.factory(provider, **strategy_params),
-                             execution=execution, risk=risk)
-    n_steps = len(selected_days) * len(underliers)
-    done    = 0
-    results = []
-    skipped: list[tuple[str, object]] = []
-
-    progress = st.progress(0, text="Starting…")
-    for ul in underliers:
-        for day in selected_days:
-            progress.progress(done / n_steps, text=f"Running {ul} · {day.strftime('%b %d')}  ({done}/{n_steps})")
-            try:
-                results.append(engine.run_day(day, ul))
-            except ValueError:
-                skipped.append((ul, day))
-            done += 1
-    progress.progress(1.0, text="Complete")
-
-    if skipped:
-        by_ul: dict[str, list] = {}
-        for ul, day in skipped:
-            by_ul.setdefault(ul, []).append(day)
-        for ul, days in by_ul.items():
-            if len(days) == len(selected_days):
-                st.error(f"**{ul}** — no data found for any selected day. Remove it from Underliers and re-run.")
-            else:
-                st.warning(f"**{ul}** — skipped {len(days)} day(s) with missing data.")
-
-    if not results:
-        st.error("No results produced. Check the underlier and date selection above.")
-        st.stop()
-
-    st.session_state["result"]        = BacktestResult(results, unit=provider.unit)
-    st.session_state["unit"]          = provider.unit
-    st.session_state["provider"]      = provider
-    st.session_state["provider_key"]  = provider_key
-    st.session_state["strategy_name"] = spec.label
-    st.session_state["date_range"]    = (start_date, end_date)
-    st.session_state["n_days"]        = len(selected_days) - len(skipped) // max(len(underliers), 1)
-    st.session_state.pop("pdf_report", None)
-
-# ---------------------------------------------------------------------------
-# Results
-# ---------------------------------------------------------------------------
-
-if "result" not in st.session_state:
-    st.info("Configure a strategy in the sidebar and click **Run Backtest** to begin.")
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Available days", len(all_days))
-    col2.metric("Period", f"{all_days[0]:%b %d, %Y} – {all_days[-1]:%b %d, %Y}" if all_days else "—")
-    col3.metric("Underliers", ", ".join(provider.underliers))
-    st.stop()
-
-result        = st.session_state["result"]
-strategy_name = st.session_state["strategy_name"]
-_d0, _d1      = st.session_state.get("date_range", (None, None))
-_n_days_run   = st.session_state.get("n_days", "?")
-
-daily     = result.daily_pnl.fillna(0)
-combined  = daily.sum().sum()
-n_trades  = len(result.trades_df)
-avg_rolls = metrics.rolls_per_day(result)["rolls"].mean()
-wr        = metrics.win_rate(result)
-
-_wr_label = " / ".join(str(ul) for ul in wr.index)
-_wr_value = " / ".join(f"{wr[ul]:.0%}" for ul in wr.index)
-_period   = f"{_d0.strftime('%b %d')} – {_d1.strftime('%b %d')}" if _d0 and _d1 else "—"
-
-col1, col2, col3, col4, col5 = st.columns(5)
-col1.metric("Period", f"{_period} ({_n_days_run}d)")
-col2.metric("Combined PnL", f"{combined:+,.1f} {_u()}")
-col3.metric("Total Trades", f"{n_trades:,}")
-col4.metric("Avg Rolls/Day", f"{avg_rolls:.0f}")
-col5.metric(f"Win Rate {_wr_label}", _wr_value)
-
-col_report, _ = st.columns([1, 4])
-if col_report.button("Generate PDF Report"):
-    with st.spinner("Building report…"):
-        st.session_state["pdf_report"] = build_pdf_report(result, strategy_name, _period)
-
-if "pdf_report" in st.session_state:
-    st.download_button(
-        label="Download PDF Report",
-        data=st.session_state["pdf_report"],
-        file_name=f"report_{strategy_name.replace(' ', '_').lower()}.pdf",
-        mime="application/pdf",
-    )
-
-st.divider()
-
-tab_ov, tab_pnl, tab_risk, tab_act, tab_detail, tab_cost, tab_log = st.tabs(
-    ["Overview", "PnL", "Risk", "Activity", "Detail", "Costs", "Log"]
+base_exec = PRESETS.get(st.session_state.get("preset") or "Next-second", ExecutionModel())
+execution_ui = ExecutionModel(
+    delay_s=int(delay_s), half_spread_bps=float(spread_bps),
+    min_half_spread=base_exec.min_half_spread if spread_bps > 0 else 0.0,
+    commission_per_contract=float(commission), commission_bps=base_exec.commission_bps,
 )
+risk_ui = RiskLimits(max_daily_loss=max_loss or None, max_open_contracts=int(max_open) or None)
 
-with tab_ov:
-    st.subheader("Summary Statistics")
-    st.dataframe(metrics.summary_table(result).style.format(precision=2), width="stretch")
+can_run = bool(underliers) and bool(selected_days)
+run_clicked = run_slot.button("Run backtest", type="primary", width="stretch", disabled=not can_run, key="run")
+run_slot.caption(f"{spec.label} · {', '.join(underliers)} · {len(selected_days)} days" if can_run
+                 else "Choose at least one underlier and a period to run.")
 
-    st.subheader("Daily PnL Calendar")
-    st.dataframe(
-        result.daily_pnl.style.format("{:.1f}").background_gradient(
-            cmap="RdYlGn", axis=None,
-            vmin=result.daily_pnl.min().min(), vmax=result.daily_pnl.max().max(),
-        ),
-        width="stretch",
-    )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(plotly_pnl_histogram(result), width="stretch")
-    with col2:
-        st.plotly_chart(plotly_pnl_waterfall(result), width="stretch")
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
 
-with tab_pnl:
-    st.plotly_chart(plotly_cumulative_pnl(result), width="stretch")
-    st.plotly_chart(plotly_daily_pnl(result), width="stretch")
+def _run(strategy_key_: str, params: dict, execution: ExecutionModel, risk: RiskLimits) -> None:
+    spec_ = specs[strategy_key_]
+    engine = BacktestEngine(provider, spec_.factory(provider, **params), execution=execution, risk=risk)
+    total = len(selected_days) * len(underliers)
+    results, skipped = [], []
+    with st.status(f"Running {spec_.label}…", expanded=True) as status:
+        bar = st.progress(0.0)
+        for ul in underliers:
+            for day in selected_days:
+                done = len(results) + len(skipped)
+                bar.progress(done / max(total, 1), text=f"{ul} · {day:%b %d}   ({done}/{total})")
+                try:
+                    results.append(engine.run_day(day, ul))
+                except ValueError:
+                    skipped.append((ul, day))
+        bar.progress(1.0, text="Done")
+        if not results:
+            status.update(label="No results", state="error")
+            st.error("No results produced. Check the underlier and date selection.")
+            return
+        meta = engine.describe() | dict(strategy=spec_.label, strategy_key=spec_.key,
+                                        params=spec_.resolve(**params), allow_short=spec_.cls.allow_short,
+                                        unlimited_risk=spec_.cls.unlimited_risk)
+        result = BacktestResult(results, unit=provider.unit, meta=meta)
+        data = build_report_data(result)
+        st.session_state["run_counter"] += 1
+        n = st.session_state["run_counter"]
+        run = dict(id=n, label=f"#{n} {spec_.label}", result=result, data=data, provider=provider,
+                   provider_key=provider_key, created=datetime.now(), skipped=skipped,
+                   cli=_cli_command(strategy_key_, params, src, underliers,
+                                    selected_days[0], selected_days[-1], execution, risk))
+        st.session_state["runs"] = ([run] + st.session_state["runs"])[:MAX_RUNS]
+        st.session_state["active_run"] = n
+        status.update(label=f"{spec_.label}: done", state="complete", expanded=False)
+    if skipped:
+        st.session_state["_flash"] = f"Skipped {len(skipped)} day/underlier combinations with missing data."
+    # Re-render from the top: otherwise the progress block stays above the results and the
+    # page keeps its scroll offset, hiding the title and header.
+    st.session_state["_scroll_top"] = True
+    st.rerun()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.plotly_chart(plotly_morning_vs_afternoon(result), width="stretch")
-    with col2:
-        st.plotly_chart(plotly_pnl_by_weekday(result), width="stretch")
 
-with tab_risk:
-    st.dataframe(metrics.risk_table(result).style.format(precision=2), width="stretch")
+quick = st.session_state.pop("_quick", None)
+if quick and can_run:
+    _run(quick[0], specs[quick[0]].resolve(**quick[1]), PRESETS[quick[2]], risk_ui)
+elif run_clicked and can_run:
+    _run(strategy_key, strategy_params, execution_ui, risk_ui)
 
-    st.plotly_chart(plotly_sharpe_ci(result), width="stretch")
-    st.plotly_chart(plotly_pnl_histogram(result, show_var=True), width="stretch")
 
-    st.plotly_chart(plotly_drawdown(result), width="stretch")
+# ---------------------------------------------------------------------------
+# landing
+# ---------------------------------------------------------------------------
 
-    dd_table = metrics.drawdown_table(result)
-    if not dd_table.empty:
-        st.dataframe(dd_table, width="stretch")
+def _go(example) -> None:
+    st.session_state["_quick"] = (example[1], example[2], example[3])
 
-    window = st.slider("Rolling Sharpe window (days)", 3, 10, 5)
-    st.plotly_chart(plotly_rolling_sharpe(result, window), width="stretch")
 
-    st.plotly_chart(plotly_expiry_day_comparison(result), width="stretch")
+def landing() -> None:
+    st.title("Strategy Backtester")
+    st.caption("Test options strategies second by second, with realistic fills, costs and risk limits.")
+    st.markdown("&nbsp;")
+    c = st.columns(3)
+    steps = [("1 · Choose data", "Real prices for NSE, NASDAQ, NYSE and more via Yahoo Finance, or a built-in synthetic market that works offline."),
+             ("2 · Choose a strategy", "Straddles, strangles and iron condors are built in; add your own in a few lines."),
+             ("3 · Run and read", "Plain-language findings, risk, costs, a PDF tearsheet, and a command to reproduce it.")]
+    for col, (h, t) in zip(c, steps):
+        with col.container(border=True):
+            st.markdown(f"**{h}**")
+            st.caption(t)
 
-    if len(daily.columns) >= 2:
-        corr = daily.iloc[:, 0].corr(daily.iloc[:, 1])
-        st.metric(f"{daily.columns[0]} / {daily.columns[1]} PnL correlation", f"{corr:.3f}")
-        st.plotly_chart(plotly_cross_underlier_scatter(result), width="stretch")
+    st.subheader("Try an example")
+    st.caption(f"Runs on the data currently selected ({provider.name}, {len(selected_days)} days)."
+               + ("" if provider.name == "synthetic" else " Option prices are modelled; the underlying is real."))
+    cols = st.columns(len(EXAMPLES))
+    for col, ex in zip(cols, EXAMPLES):
+        with col.container(border=True):
+            st.markdown(f"**{ex[0]}**")
+            st.caption(ex[4])
+            st.button("Run this", key=f"ex_{ex[1]}", on_click=_go, args=(ex,), disabled=not can_run, width="stretch")
 
-with tab_act:
-    total_rolls = metrics.rolls_per_day(result)["rolls"].sum()
-    if total_rolls == 0:
-        st.info("No rolls — this strategy holds a fixed position.")
-    else:
-        st.plotly_chart(plotly_rolls_per_day(result), width="stretch")
-        st.plotly_chart(plotly_roll_interval_dist(result), width="stretch")
-    st.plotly_chart(plotly_avg_intraday_mtm(result), width="stretch")
+    st.subheader("Available strategies")
+    st.dataframe(pd.DataFrame([{"Strategy": s.label, "What it does": s.description,
+                                "Parameters": ", ".join(p.name for p in s.params) or "—"}
+                               for s in specs.values()]), hide_index=True, width="stretch")
 
-with tab_detail:
-    avail_dates = sorted({dr.date for dr in result.day_results})
-    avail_uls   = sorted({dr.underlier for dr in result.day_results})
 
-    col1, col2 = st.columns(2)
-    sel_date = col1.selectbox("Date", avail_dates)
-    sel_ul   = col2.selectbox("Underlier", avail_uls)
+# ---------------------------------------------------------------------------
+# results
+# ---------------------------------------------------------------------------
 
-    dr = next((d for d in result.day_results if d.date == sel_date and d.underlier == sel_ul), None)
+def results_view(runs: list) -> None:
+    ids = [r["id"] for r in runs]
+    active_id = st.session_state.get("active_run", ids[0])
+    run = next((r for r in runs if r["id"] == active_id), runs[0])
+    d, result = run["data"], run["result"]
+    if flash := st.session_state.pop("_flash", None):
+        st.warning(flash)
+    label_of = {r["id"]: r["label"] for r in runs}
 
-    if not dr:
-        st.warning("No result for this combination.")
-    else:
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Final PnL", f"{dr.final_pnl:+.2f} {_u()}")
-        col2.metric("Trades", len(dr.trades))
-        col3.metric("Peak MTM", f"{dr.mtm.max():+.2f} {_u()}")
-        col4.metric("Trough MTM", f"{dr.mtm.min():+.2f} {_u()}")
+    head, pick, export = st.columns([5, 3, 1.4], vertical_alignment="bottom")
+    head.title(d.strategy_name)
+    if len(runs) > 1:
+        sel = pick.selectbox("Run", ids, index=ids.index(run["id"]), format_func=label_of.get, key="run_picker")
+        if sel != run["id"]:
+            st.session_state["active_run"] = sel
+            st.rerun()
+    with export.popover("Export", width="stretch"):
+        st.caption("Reproduce this run from a terminal:")
+        st.code(run["cli"], language="bash")
+        if st.button("Build PDF report", key=f"pdf_{run['id']}", width="stretch"):
+            with st.spinner("Building report…"):
+                run["pdf"] = build_pdf_report(result)
+        if run.get("pdf"):
+            st.download_button("Download PDF", run["pdf"], file_name=f"report_{d.strategy_name.replace(' ', '_').lower()}.pdf",
+                               mime="application/pdf", width="stretch", key=f"dlpdf_{run['id']}")
+        st.download_button("Download trades (CSV)", result.trades_df.to_csv(index=False),
+                           file_name=f"trades_{run['id']}.csv", mime="text/csv", width="stretch", key=f"dlcsv_{run['id']}")
+    ex = result.meta.get("execution", {})
+    fill = "same-second fills" if ex.get("delay_s") == 0 else f"fills +{ex.get('delay_s', 1)}s"
+    costs = bool(ex.get("half_spread_bps") or ex.get("commission_per_contract") or ex.get("commission_bps"))
+    st.caption(f"{d.period_label}  ·  {d.n_days} days  ·  {', '.join(d.underliers)}  ·  {run['provider'].name} data  ·  "
+               f"{fill}, {'with trading costs' if costs else 'no trading costs'}")
 
-        st.divider()
+    with st.container(border=True):
+        st.markdown("**What happened**")
+        for line in d.observations:
+            st.markdown(f"- {_esc(line)}")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(plotly_futures_through_day(dr), width="stretch")
-        with col2:
-            if not dr.holdings_log.empty:
-                st.plotly_chart(plotly_leg_prices(dr), width="stretch")
+    u = d.unit
+    lo, hi = d.sharpe_ci
+    cost = d.fees + d.slippage
+    flat = dict(delta_color="off", delta_arrow="off")
+    k = st.columns(6)
+    k[0].metric("Net PnL", _money(d.net_pnl, u, signed=True),
+                delta=_esc(f"gross {_money(d.gross_pnl, u, signed=True)}") if cost else None, **flat)
+    k[1].metric("Sharpe", f"{d.sharpe:.2f}", delta=f"95% CI {lo:.1f} to {hi:.1f}" if lo == lo else None,
+                help="Annualised, risk-free = 0. Interval is a bootstrap over days.", **flat)
+    k[2].metric("Max drawdown", _money(d.max_dd, u), delta=f"longest {d.max_dd_days} days", **flat)
+    k[3].metric("Day win rate", f"{d.win_rate:.0%}", delta=f"profit factor {d.profit_factor:.2f}", **flat)
+    k[4].metric("Trades", f"{d.n_trades:,}", delta=f"{d.n_trades / max(d.n_days, 1):,.0f} per day", **flat)
+    k[5].metric("Costs paid", _money(cost, u),
+                delta=_esc(f"fees {T.fcompact(d.fees, u)} + slippage {T.fcompact(d.slippage, u)}"), **flat)
 
-        st.plotly_chart(plotly_futures_vs_strike(dr), width="stretch")
+    names = ["Overview", "Risk", "Behaviour", "Costs", "Days & trades", "Drill-down"] + (["Compare"] if len(runs) > 1 else [])
+    tabs = st.tabs(names)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(plotly_intraday_mtm(dr), width="stretch")
-        with col2:
-            if not dr.holdings_log.empty:
-                st.plotly_chart(plotly_strike_held(dr), width="stretch")
+    with tabs[0]:
+        st.markdown("##### Cumulative net PnL")
+        st.plotly_chart(charts.equity(d), theme="streamlit", width="stretch")
+        a, b = st.columns(2)
+        with a:
+            st.markdown("##### Drawdown from running peak")
+            st.plotly_chart(charts.drawdown(d), theme="streamlit", width="stretch")
+        with b:
+            st.markdown("##### Daily net PnL")
+            st.plotly_chart(charts.daily_bars(d), theme="streamlit", width="stretch")
+        st.markdown("##### Performance statistics")
+        st.dataframe(pd.DataFrame(d.stats_rows, columns=["Metric"] + d.stats_cols).set_index("Metric"), width="stretch")
 
-        st.plotly_chart(plotly_realized_staircase(dr), width="stretch")
+    with tabs[1]:
+        a, b = st.columns(2)
+        with a:
+            st.markdown("##### Risk metrics")
+            st.caption(d.risk_note)
+            st.dataframe(pd.DataFrame(d.risk_rows, columns=["Metric"] + d.stats_cols).set_index("Metric"), width="stretch")
+            st.markdown("##### Largest drawdown episodes")
+            if d.drawdown_rows:
+                st.dataframe(pd.DataFrame(d.drawdown_rows, columns=["Series", "Trough", "Depth", "Recovered"]),
+                             hide_index=True, width="stretch")
+            else:
+                st.caption("No drawdowns.")
+        with b:
+            st.markdown("##### Sharpe ratio with 95% interval")
+            st.plotly_chart(charts.sharpe_ci(d), theme="streamlit", width="stretch")
+            st.markdown("##### Distribution of daily PnL")
+            st.plotly_chart(charts.histogram(d), theme="streamlit", width="stretch")
 
-with tab_cost:
-    be_bps = metrics.breakeven_bps(result)
-    if be_bps >= 0:
-        st.metric("Break-even Cost", f"{be_bps:.2f} bps", help="Cost per trade at which net PnL = 0")
-    else:
-        st.metric(
-            "Break-even Cost", "N/A (loss-making at zero cost)",
-            help=f"Needs a {abs(be_bps):.2f} bps/trade subsidy to break even",
-        )
+    with tabs[2]:
+        a, b = st.columns(2)
+        with a:
+            st.markdown("##### Average intraday PnL path")
+            st.plotly_chart(charts.intraday(d), theme="streamlit", width="stretch")
+            st.markdown("##### Average PnL by weekday")
+            st.plotly_chart(charts.weekday(d), theme="streamlit", width="stretch")
+        with b:
+            st.markdown("##### Morning vs afternoon")
+            st.plotly_chart(charts.am_pm(d), theme="streamlit", width="stretch")
+            st.markdown("##### Expiry day vs other days")
+            st.plotly_chart(charts.expiry(d), theme="streamlit", width="stretch")
 
-    st.plotly_chart(plotly_cost_sensitivity(result), width="stretch")
+    with tabs[3]:
+        a, b = st.columns(2)
+        with a:
+            st.markdown("##### From gross to net PnL")
+            st.plotly_chart(charts.cost_waterfall(d), theme="streamlit", width="stretch")
+        with b:
+            st.markdown("##### Sensitivity to extra costs")
+            st.plotly_chart(charts.cost_sensitivity(d), theme="streamlit", width="stretch")
+        a, b = st.columns(2)
+        with a:
+            st.markdown("##### Cost breakdown")
+            st.dataframe(pd.DataFrame(d.cost_rows, columns=["", "Gross", "Slippage", "Fees", "Net"]).set_index(""),
+                         width="stretch")
+            st.caption("Gross = mid-price fills with no fees. Slippage = spread paid versus mid. "
+                       "Both are already inside net PnL.")
+        with b:
+            st.markdown("##### Trading activity")
+            st.dataframe(pd.DataFrame(d.activity_rows, columns=["", "Value"]).set_index(""), width="stretch")
 
-    cs = metrics.cost_sensitivity(result)
-    st.dataframe(cs.style.format(precision=2), width="stretch")
-    st.caption(
-        "Extra cost = total notional × bps ÷ 10,000, charged on top of any fees "
-        "already in the run (set under Execution & risk). Notional uses the contract multiplier."
-    )
+    with tabs[4]:
+        st.markdown("##### Daily net PnL")
+        frame = d.daily.copy()
+        if len(d.underliers) > 1:
+            frame["Combined"] = d.combined
+        frame["Cumulative"] = d.cum_combined
+        cols = [c for c in frame.columns if c != "Cumulative"]
+        bound = max(float(frame[cols].abs().to_numpy().max()), 1e-9)
+        st.dataframe(frame.style.background_gradient(cmap="RdBu", vmin=-bound, vmax=bound, subset=cols, axis=None)
+                     .format("{:,.0f}"), width="stretch", height=min(40 + 35 * len(frame), 520))
+        st.markdown("##### Trade log")
+        trades = result.trades_df
+        if trades.empty:
+            st.caption("No trades.")
+        else:
+            uls = sorted(trades["underlier"].unique())
+            c1, c2, c3 = st.columns(3)
+            f_ul = c1.multiselect("Underlier", uls, default=uls, key="f_ul")
+            f_side = c2.multiselect("Side", ["BUY", "SELL"], default=["BUY", "SELL"], key="f_side")
+            f_date = c3.selectbox("Date", ["All"] + sorted(trades["date"].astype(str).unique()), key="f_date")
+            view = trades[trades["underlier"].isin(f_ul) & trades["side"].isin(f_side)]
+            if f_date != "All":
+                view = view[view["date"].astype(str) == f_date]
+            st.caption(f"Showing {min(len(view), 2000):,} of {len(view):,} matching trades ({len(trades):,} total)")
+            st.dataframe(view.head(2000), hide_index=True, width="stretch", height=380,
+                         column_config={"price": st.column_config.NumberColumn(format="%.2f"),
+                                        "fee": st.column_config.NumberColumn(format="%.2f"),
+                                        "slippage": st.column_config.NumberColumn(format="%.2f")})
 
-with tab_log:
-    trades = result.trades_df
+    with tabs[5]:
+        c1, c2 = st.columns(2)
+        sel_date = c1.selectbox("Date", sorted({x.date for x in result.day_results}), key="dd_date")
+        sel_ul = c2.selectbox("Underlier", sorted({x.underlier for x in result.day_results}), key="dd_ul")
+        dr = next((x for x in result.day_results if x.date == sel_date and x.underlier == sel_ul), None)
+        if dr is None:
+            st.warning("No result for this combination.")
+        else:
+            m = st.columns(5)
+            m[0].metric("Net PnL", _money(dr.final_pnl, u, signed=True))
+            m[1].metric("Trades", len(dr.trades))
+            m[2].metric("Peak", _money(dr.mtm.max(), u, signed=True))
+            m[3].metric("Trough", _money(dr.mtm.min(), u, signed=True))
+            m[4].metric("Costs", _money(dr.fees + dr.slippage, u))
+            if dr.rejections:
+                st.warning(f"{len(dr.rejections)} orders rejected: " + "; ".join(sorted({r.reason for r in dr.rejections})))
+            underlying = _underlying(run["provider"], run["provider_key"], dr.date, dr.underlier)
+            a, b = st.columns(2)
+            with a:
+                st.markdown("##### Net mark-to-market")
+                st.plotly_chart(charts.day_mtm(dr, u), theme="streamlit", width="stretch")
+                st.markdown("##### Underlying and strike held")
+                st.plotly_chart(charts.day_price_strike(dr, underlying, u), theme="streamlit", width="stretch")
+            with b:
+                st.markdown("##### MTM vs realised")
+                st.plotly_chart(charts.day_realized(dr, u), theme="streamlit", width="stretch")
+                if not dr.holdings_log.empty:
+                    st.markdown("##### Option prices of the position")
+                    st.plotly_chart(charts.day_legs(dr, u), theme="streamlit", width="stretch")
 
-    col1, col2, col3 = st.columns(3)
-    f_ul = col1.multiselect(
-        "Underlier", trades["underlier"].unique().tolist(),
-        default=trades["underlier"].unique().tolist(),
-    )
-    f_side = col2.multiselect("Side", ["BUY", "SELL"], default=["BUY", "SELL"])
-    f_date = col3.selectbox("Date", ["All"] + sorted(trades["date"].astype(str).unique().tolist()))
+    if len(runs) > 1:
+        with tabs[6]:
+            picks = st.multiselect("Runs to compare", ids, default=ids[:3], format_func=label_of.get, key="cmp")
+            chosen = [r for r in runs if r["id"] in picks]
+            if chosen:
+                if len({r["provider_key"] for r in chosen}) > 1:
+                    st.warning("These runs use different market data; compare with care.")
+                st.plotly_chart(charts.compare_equity(chosen), theme="streamlit", width="stretch")
+                rows = []
+                for r in chosen:
+                    x = r["data"]
+                    rows.append({"Run": r["label"], "Net PnL": _money(x.net_pnl, x.unit, signed=True),
+                                 "Sharpe": f"{x.sharpe:.2f}", "Max drawdown": _money(x.max_dd, x.unit),
+                                 "Day win rate": f"{x.win_rate:.0%}", "Trades": f"{x.n_trades:,}",
+                                 "Costs": _money(x.fees + x.slippage, x.unit),
+                                 "Execution": dict(x.config_rows).get("Execution", "")})
+                st.dataframe(pd.DataFrame(rows).set_index("Run"), width="stretch")
+    if len(runs) > 0 and st.sidebar.button("Clear run history", key="clear"):
+        st.session_state["runs"] = []
+        st.rerun()
 
-    filtered = trades[trades["underlier"].isin(f_ul) & trades["side"].isin(f_side)]
-    if f_date != "All":
-        filtered = filtered[filtered["date"].astype(str) == f_date]
 
-    st.caption(f"Showing {len(filtered):,} of {len(trades):,} trades")
-    st.dataframe(filtered, width="stretch", height=500)
-
-    st.download_button(
-        label="Download CSV",
-        data=filtered.to_csv(index=False),
-        file_name=f"trades_{strategy_name.replace(' ', '_').lower()}.csv",
-        mime="text/csv",
-    )
+runs = st.session_state["runs"]
+if runs:
+    results_view(runs)
+else:
+    landing()

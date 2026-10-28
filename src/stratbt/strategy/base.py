@@ -54,9 +54,14 @@ class BaseStrategy(ABC):
     allow_short : bool
         Set True if the strategy sells options it doesn't hold (short
         premium). The engine then lets its broker open short positions.
+    unlimited_risk : bool
+        Set True if the structure can lose more than a fixed amount (naked
+        short options). Reports then warn that observed drawdowns understate
+        the tail.
     """
 
     allow_short: bool = False
+    unlimited_risk: bool = False
 
     @abstractmethod
     def on_second(

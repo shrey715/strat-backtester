@@ -32,6 +32,7 @@ class Fill:
     qty: int
     price: float
     fee: float
+    slippage: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,19 @@ class Rejection:
 
 
 class Broker(ABC):
-    """Executes Orders and reports what is held."""
+    """
+    Executes Orders and reports what is held. A live adapter implements
+    `submit`, `holdings` and `equity`; the rest has working defaults.
+    """
+
+    halted: bool = False                 # set True to refuse new risk (e.g. daily loss limit hit)
+
+    def check_risk(self, net_equity: float) -> None:
+        """Called every second with current net PnL; brokers with loss limits latch `halted` here."""
+
+    def flatten_orders(self) -> list[Order]:
+        """Orders that close every open position."""
+        return [Order(inst, "SELL" if qty > 0 else "BUY", abs(qty)) for inst, (_, qty) in self.holdings.items()]
 
     @abstractmethod
     def submit(self, order: Order, ts: pd.Timestamp, ref_price: float | None) -> Fill | None:
@@ -130,11 +143,12 @@ class PaperBroker(Broker):
 
         price = self.execution.fill_price(order.side, ref_price)
         fee = self.execution.fee(price, order.qty, self.position.multiplier)
+        slip = abs(price - ref_price) * order.qty * self.position.multiplier
         if order.side == "BUY":
-            self.position.buy(ts, order.instrument, price, order.qty, fee=fee)
+            self.position.buy(ts, order.instrument, price, order.qty, fee=fee, slippage=slip)
         else:
-            self.position.sell(ts, order.instrument, price, order.qty, fee=fee)
-        return Fill(ts, order.instrument, order.side, order.qty, price, fee)
+            self.position.sell(ts, order.instrument, price, order.qty, fee=fee, slippage=slip)
+        return Fill(ts, order.instrument, order.side, order.qty, price, fee, slip)
 
     # ---- risk ----------------------------------------------------------
     def _risk_reason(self, order: Order, closing: bool) -> str | None:
@@ -159,13 +173,6 @@ class PaperBroker(Broker):
             self.halted = True
             logger.warning("Daily loss limit %.2f breached (equity %.2f): flattening and halting",
                            limit, net_equity)
-
-    def flatten_orders(self) -> list[Order]:
-        """Orders that close every open position."""
-        return [
-            Order(inst, "SELL" if qty > 0 else "BUY", abs(qty))
-            for inst, (_, qty) in self.position.holdings.items()
-        ]
 
     def _reject(self, ts: pd.Timestamp, order: Order, reason: str) -> None:
         logger.warning("Rejected %s %s at %s: %s", order.side, order.instrument.filename, ts, reason)

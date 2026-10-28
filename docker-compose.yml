@@ -4,8 +4,12 @@ services:
     container_name: strat_backtester
     ports:
       - "8501:8501"
+    environment:
+      # yahoo (real prices, needs internet) or synthetic (offline)
+      STRATBT_SOURCE: ${STRATBT_SOURCE:-yahoo}
     volumes:
-      # Optional: mount NSE tick data (NSE_YYYYMMDD/ folders) read-only.
-      # Without it the dashboard uses the built-in synthetic market.
-      - ${STRATBT_DATA_DIR:-./data/allData}:/data:ro
+      - stratbt-cache:/root/.cache/stratbt      # downloaded bars survive restarts
     restart: unless-stopped
+
+volumes:
+  stratbt-cache:

@@ -367,6 +367,31 @@ def cost_sensitivity(
         })
     return pd.DataFrame(rows)
 
+def cost_breakdown(result: BacktestResult) -> pd.DataFrame:
+    """
+    Where the money went, per underlier plus a Total row, in the result's
+    unit: gross PnL (what mid-price fills with no fees would have made),
+    minus slippage (spread paid), minus fees, equals net PnL.
+
+    Returns
+    -------
+    pd.DataFrame
+        Index = underlier (+ "Total"); columns gross, slippage, fees, net.
+    """
+    rows = {}
+    for dr in result.day_results:
+        r = rows.setdefault(dr.underlier, {"net": 0.0, "slippage": 0.0, "fees": 0.0})
+        r["net"] += dr.final_pnl
+        r["slippage"] += dr.slippage
+        r["fees"] += dr.fees
+    if not rows:
+        return pd.DataFrame(columns=["gross", "slippage", "fees", "net"])
+    df = pd.DataFrame(rows).T
+    df["gross"] = df["net"] + df["slippage"] + df["fees"]
+    df = df[["gross", "slippage", "fees", "net"]]
+    df.loc["Total"] = df.sum()
+    return df
+
 def summary_table(result: BacktestResult) -> pd.DataFrame:
     """
     Parameters
